@@ -10,7 +10,35 @@ the host; cliproxy reads that host's OAuth credentials, refreshes them on
 demand, and forwards Anthropic Messages API requests from per-terminal API
 keys it issues itself. See `README.md` for the user-facing walkthrough.
 
-## Build / run / test
+## Rust rewrite (in progress)
+
+The project is being rewritten as **CC Manager** — a Tauri v2 desktop app
+modelled on lbjlaq/Antigravity-Manager, Claude OAuth accounts only (no
+Anthropic API-key accounts). The phase plan is `docs/ROADMAP.zh.md`. The Go
+code below stays until phase R1 reaches parity, then gets deleted.
+
+- `crates/ccm-core` — all logic, no GUI deps: `config.rs` (defaults →
+  `config.json` → `CCM_*` env), `store.rs` (rusqlite, embedded migrations
+  tracked in `schema_migrations`), `secret.rs` (AES-256-GCM, key from
+  `CCM_SECRET_KEY` or auto-created `data_dir/secret.key`), `accounts.rs`,
+  `oauth.rs` (credentials file shapes, refresh), `provider.rs`
+  (`AccountProvider`, `AccountPool`, first-start import), `http.rs` (Axum).
+- `crates/ccm-server` — headless binary (`ccm-server serve|config`).
+- `src-tauri` — desktop shell: runs the core server in-process, tray icon,
+  Tauri commands for the UI. Bundles NSIS / AppImage / deb / dmg.
+- `src/` + `index.html` — React + TypeScript + Vite + Tailwind UI shared by
+  both shells; `src/api.ts` picks Tauri `invoke` or HTTP.
+
+Commands: `cargo test --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo fmt --all --check`, `pnpm install`, `pnpm build`,
+`pnpm tauri dev` (desktop), `cargo run -p ccm-server` (headless). Building
+`src-tauri` on Linux needs `libwebkit2gtk-4.1-dev`,
+`libayatana-appindicator3-dev` and `librsvg2-dev`.
+
+Any new UI capability needs both a Tauri command (desktop) and an
+`/admin/api/*` endpoint (headless), wrapped once in `src/api.ts`.
+
+## Build / run / test (Go version)
 
 - `go build ./cmd/cliproxy` — single static binary, no CGO required
   (modernc.org/sqlite is pure Go).

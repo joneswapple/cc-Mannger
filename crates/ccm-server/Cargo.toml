@@ -1,0 +1,14 @@
+[package]
+name = "ccm-server"
+description = "Headless CC Manager server (Docker / browser mode)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ccm-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
