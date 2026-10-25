@@ -1236,3 +1236,150 @@ async fn captures_quota_headers_and_routes_around_exhausted_accounts() {
         .await;
     assert_eq!(h.tokens_seen().last().unwrap(), "upstream-access");
 }
+
+#[tokio::test]
+async fn model_routes_rewrite_before_policy_and_upstream() {
+    let h = harness().await;
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/admin/api/settings/model-routes",
+            Some(json!({"routes": [{"pattern": "re:^gpt-", "target": "claude-test"}]})),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let (status, e) = h
+        .admin(
+            "POST",
+            "/admin/api/settings/model-routes",
+            Some(json!({"routes": [{"pattern": "re:(", "target": "x"}]})),
+        )
+        .await;
+    assert_eq!(status, 400, "{e}");
+    let (_, settings) = h.admin("GET", "/admin/api/settings", None).await;
+    assert_eq!(settings["model_routes"][0]["target"], "claude-test");
+
+    h.messages(r#"{"model":"gpt-4o","messages":[]}"#, &[]).await;
+    assert_eq!(
+        json(&h.last_seen("/v1/messages").body)["model"],
+        "claude-test"
+    );
+    h.core.recorder.flush();
+    let (rows, _) = h.core.recorder.search(&SearchFilter::default()).unwrap();
+    assert_eq!(
+        rows[0].model, "claude-test",
+        "stats record the routed model"
+    );
+    // Policy applies to the routed model.
+    h.core
+        .policy
+        .set_disabled_models(&["claude-test".into()])
+        .unwrap();
+    let (status, _, _) = h.messages(r#"{"model":"gpt-4o","messages":[]}"#, &[]).await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn openai_chat_completions_non_streaming() {
+    let h = harness().await;
+    h.set_reply(Reply::Json(
+        200,
+        vec![],
+        r#"{"id":"msg_7","type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"Hi there"}],"usage":{"input_tokens":9,"output_tokens":2}}"#,
+    ));
+    let req = json!({"model": "claude-test", "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}], "max_tokens": 50});
+    let (status, _, body) = h
+        .call(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {}", h.api_key))
+                .header("content-type", "application/json")
+                .body(Body::from(req.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let v = json(&body);
+    assert_eq!(v["object"], "chat.completion");
+    assert_eq!(v["choices"][0]["message"]["content"], "Hi there");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(v["usage"]["total_tokens"], 11);
+
+    let sent = json(&h.last_seen("/v1/messages").body);
+    assert_eq!(sent["max_tokens"], 50);
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "hello");
+    // The Claude Code identifier comes first, then the OpenAI system prompt.
+    assert_eq!(
+        sent["system"][0]["text"],
+        ccm_core::rewrite::CLAUDE_CODE_IDENTIFIER
+    );
+    assert_eq!(sent["system"][1]["text"], "sys");
+    h.core.recorder.flush();
+    let (rows, _) = h.core.recorder.search(&SearchFilter::default()).unwrap();
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (9, 2));
+}
+
+#[tokio::test]
+async fn openai_chat_completions_streaming_and_errors() {
+    let h = harness().await;
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"usage\":{\"input_tokens\":3}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Yo\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    h.set_reply(Reply::Sse(sse));
+    let req = json!({"model": "claude-test", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+    let call = |body: Value| {
+        Request::post("/v1/chat/completions")
+            .header("authorization", format!("Bearer {}", h.api_key))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, headers, body) = h.call(call(req)).await;
+    assert_eq!(status, 200);
+    assert!(hdr(&headers, "content-type").starts_with("text/event-stream"));
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("\"content\":\"Yo\""), "{text}");
+    assert!(text.contains("\"finish_reason\":\"stop\""));
+    assert!(text.trim_end().ends_with("data: [DONE]"));
+    h.core.recorder.flush();
+    let (rows, _) = h.core.recorder.search(&SearchFilter::default()).unwrap();
+    assert_eq!(
+        (rows[0].input_tokens, rows[0].output_tokens),
+        (3, 1),
+        "usage still captured under translation"
+    );
+
+    // Upstream errors keep their status and an error.message body.
+    h.set_reply(Reply::Json(429, vec![("retry-after", "5")], RATE_LIMITED));
+    let (status, headers, body) = h
+        .call(call(
+            json!({"model": "claude-test", "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await;
+    assert_eq!(status, 429);
+    assert_eq!(hdr(&headers, "retry-after"), "5");
+    assert_eq!(json(&body)["error"]["message"], "Error");
+
+    let (status, _, body) = h.call(call(json!({"model": "claude-test"}))).await;
+    assert_eq!(status, 400);
+    assert!(json(&body)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("messages"));
+}
+
+#[tokio::test]
+async fn models_list_has_openai_fields() {
+    let h = harness().await;
+    let req = Request::get("/v1/models")
+        .header("authorization", format!("Bearer {}", h.api_key))
+        .body(Body::empty())
+        .unwrap();
+    let v = json(&h.call(req).await.2);
+    assert_eq!(v["object"], "list");
+    assert_eq!(v["data"][0]["object"], "model");
+    assert_eq!(v["data"][0]["owned_by"], "anthropic");
+    assert_eq!(v["data"][0]["type"], "model");
+}

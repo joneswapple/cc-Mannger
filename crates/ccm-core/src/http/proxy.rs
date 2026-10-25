@@ -1,4 +1,5 @@
-//! `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`.
+//! `POST /v1/messages`, `POST /v1/chat/completions` (OpenAI-compatible),
+//! `POST /v1/messages/count_tokens`, `GET /v1/models`.
 
 use std::time::Instant;
 
@@ -16,10 +17,11 @@ use crate::auth::Identity;
 use crate::capture::{Captured, TeeStream};
 use crate::policy::Denied;
 use crate::pool::{AllCooling, NoAccount, PickRequest};
-use crate::rewrite;
 use crate::stats::Event;
 use crate::upstream::{passthrough_user_agent, Attempt, ForwardError, ForwardExtra, Forwarded};
 use crate::Core;
+use crate::{openai, rewrite};
+use futures_util::StreamExt;
 
 #[derive(Deserialize)]
 struct MessageRequest {
@@ -136,42 +138,65 @@ fn response_head(resp: &reqwest::Response) -> axum::http::response::Builder {
     b
 }
 
-pub(super) async fn messages(
-    State(core): State<Core>,
-    ApiIdentity(id): ApiIdentity,
-    headers: HeaderMap,
+/// An upstream answer to a messages call, plus the hook that records it
+/// once the body has been consumed.
+struct Dispatched {
+    resp: reqwest::Response,
+    status: u16,
+    finish: Box<dyn FnOnce(Captured) + Send>,
+}
+
+/// The shared `/v1/messages` pipeline: model routing, effort tiers, policy,
+/// system injection, failover forwarding, and stats for failed attempts.
+/// Errors are client-ready Anthropic-shaped responses.
+async fn dispatch(
+    core: &Core,
+    id: Identity,
+    headers: &HeaderMap,
     body: Bytes,
-) -> Response {
-    let parsed: MessageRequest = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("parse body: {e}"),
-            )
-        }
-    };
+) -> Result<Dispatched, Response> {
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("parse body: {e}"),
+        )
+    })?;
+    let parsed: MessageRequest = serde_json::from_value(value.clone()).unwrap_or(MessageRequest {
+        model: String::new(),
+        metadata: None,
+    });
     if parsed.model.is_empty() {
-        return anthropic_error(
+        return Err(anthropic_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "model is required",
-        );
+        ));
     }
     let sticky = sticky_key(&parsed, &id);
-    let model = parsed.model;
 
-    // Effort tiers first, so later steps see a canonical body.
+    // Model routes first: policy and stats see the model actually used.
+    let model = core
+        .routing
+        .resolve(&parsed.model, &value)
+        .map_err(|e| internal(format!("routing: {e:#}")))?;
+    let body = if model != parsed.model {
+        value["model"] = serde_json::json!(model);
+        Bytes::from(serde_json::to_vec(&value).map_err(internal)?)
+    } else {
+        body
+    };
+
+    // Effort tiers next, so later steps see a canonical body.
     let body = match rewrite::apply_effort(&body, &core.config.upstream.effort_levels) {
         Ok(Some(b)) => Bytes::from(b),
         Ok(None) => body,
         Err(e) => {
-            return anthropic_error(
+            return Err(anthropic_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 e.to_string(),
-            )
+            ))
         }
     };
 
@@ -186,18 +211,12 @@ pub(super) async fn messages(
                     (StatusCode::FORBIDDEN, "permission_error")
                 }
             };
-            return anthropic_error(status, kind, denied.to_string());
+            return Err(anthropic_error(status, kind, denied.to_string()));
         }
-        Err(e) => {
-            return anthropic_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                format!("policy: {e:#}"),
-            )
-        }
+        Err(e) => return Err(internal(format!("policy: {e:#}"))),
     };
 
-    let body = maybe_inject(&core, body);
+    let body = maybe_inject(core, body);
     let start = Instant::now();
     let event = move |account_id: i64, status: u16, c: &Captured, error: String| Event {
         ts: crate::now_unix(),
@@ -226,7 +245,7 @@ pub(super) async fn messages(
             Method::POST,
             "/v1/messages",
             Some(body),
-            &forward_extra(&headers),
+            &forward_extra(headers),
         )
         .await
         .or_else(ForwardError::into_forwarded);
@@ -243,29 +262,17 @@ pub(super) async fn messages(
     }
     let Forwarded {
         resp, account_id, ..
-    } = match result {
-        Ok(f) => f,
-        Err(e) => return forward_error(&e),
-    };
+    } = result.map_err(|e| forward_error(&e))?;
     let status = resp.status().as_u16();
-    let head = response_head(&resp);
-    let is_sse = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
-    let request_id_hdr = resp
-        .headers()
-        .get("request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
+    let header_str = |k: &str| {
+        resp.headers()
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let request_id_hdr = header_str("request-id");
+    let retry_after = header_str("retry-after");
 
     let recorder = core.recorder.clone();
     let user = id_summary(&id);
@@ -284,29 +291,134 @@ pub(super) async fn messages(
         }
         recorder.record(event(account_id, status, &c, summary));
     };
+    Ok(Dispatched {
+        resp,
+        status,
+        finish: Box::new(finish),
+    })
+}
 
-    if is_sse {
-        let stream = TeeStream::new(Box::pin(resp.bytes_stream()), finish);
+fn is_sse(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"))
+}
+
+/// Reads a whole upstream body, recording it; read failures become 502s.
+async fn buffered(d: Dispatched) -> Result<Bytes, Response> {
+    match d.resp.bytes().await {
+        Ok(buf) => {
+            (d.finish)(Captured::from_json(&buf));
+            Ok(buf)
+        }
+        Err(e) => {
+            (d.finish)(Captured {
+                error_message: e.to_string(),
+                ..Default::default()
+            });
+            Err(anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!("upstream: read body: {e}"),
+            ))
+        }
+    }
+}
+
+pub(super) async fn messages(
+    State(core): State<Core>,
+    ApiIdentity(id): ApiIdentity,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let d = match dispatch(&core, id, &headers, body).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let head = response_head(&d.resp);
+    if is_sse(&d.resp) {
+        let stream = TeeStream::new(Box::pin(d.resp.bytes_stream()), d.finish);
         return head
             .body(Body::from_stream(stream))
             .unwrap_or_else(internal);
     }
-    match resp.bytes().await {
-        Ok(buf) => {
-            finish(Captured::from_json(&buf));
-            head.body(Body::from(buf)).unwrap_or_else(internal)
-        }
+    match buffered(d).await {
+        Ok(buf) => head.body(Body::from(buf)).unwrap_or_else(internal),
+        Err(resp) => resp,
+    }
+}
+
+/// OpenAI-compatible chat completions over the same pipeline. Successful
+/// responses are translated; errors keep Anthropic's
+/// `{"error":{"type","message"}}` body, which OpenAI SDKs read as well.
+pub(super) async fn chat_completions(
+    State(core): State<Core>,
+    ApiIdentity(id): ApiIdentity,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
         Err(e) => {
-            finish(Captured {
-                error_message: e.to_string(),
-                ..Default::default()
-            });
-            anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                format!("upstream: read body: {e}"),
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("parse body: {e}"),
             )
         }
+    };
+    let (anthropic, info) = match openai::to_anthropic(&req) {
+        Ok(x) => x,
+        Err(e) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("{e:#}"),
+            )
+        }
+    };
+    let body = match serde_json::to_vec(&anthropic) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => return internal(e),
+    };
+    // The client's headers describe an OpenAI request; only the UA carries over.
+    let mut fwd_headers = HeaderMap::new();
+    if let Some(ua) = headers.get("user-agent") {
+        fwd_headers.insert("user-agent", ua.clone());
+    }
+    let d = match dispatch(&core, id, &fwd_headers, body).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    if d.status >= 400 {
+        let mut head = Response::builder()
+            .status(d.status)
+            .header("content-type", "application/json");
+        if let Some(v) = d.resp.headers().get("retry-after") {
+            head = head.header("retry-after", v.clone());
+        }
+        return match buffered(d).await {
+            Ok(buf) => head.body(Body::from(buf)).unwrap_or_else(internal),
+            Err(resp) => resp,
+        };
+    }
+    if is_sse(&d.resp) {
+        let mut translator = openai::StreamTranslator::new(info);
+        let stream = TeeStream::new(Box::pin(d.resp.bytes_stream()), d.finish)
+            .map(move |chunk| chunk.map(|b| Bytes::from(translator.feed(&b))));
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(internal);
+    }
+    match buffered(d).await {
+        Ok(buf) => match serde_json::from_slice::<serde_json::Value>(&buf) {
+            Ok(v) => Json(openai::from_anthropic(&v, &info)).into_response(),
+            Err(e) => internal(format!("decode upstream response: {e}")),
+        },
+        Err(resp) => resp,
     }
 }
 
@@ -330,6 +442,20 @@ pub(super) async fn count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Count against the model the request would really be sent to.
+    let body = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(mut v) => match v["model"].as_str().map(String::from) {
+            Some(m) => match core.routing.resolve(&m, &v) {
+                Ok(target) if target != m => {
+                    v["model"] = json!(target);
+                    serde_json::to_vec(&v).map(Bytes::from).unwrap_or(body)
+                }
+                _ => body,
+            },
+            None => body,
+        },
+        Err(_) => body,
+    };
     let body = maybe_inject(&core, body);
     let group = match core.policy.get_policy(id.user_id) {
         Ok(p) => p.account_group,
@@ -374,12 +500,21 @@ pub(super) async fn models(State(core): State<Core>, ApiIdentity(_): ApiIdentity
         .models()
         .into_iter()
         .map(|m| {
-            let mut row = json!({"type": "model", "id": m.id, "display_name": m.display_name});
+            // Anthropic fields plus OpenAI's, so both SDKs can list models.
+            let created = m
+                .created_at
+                .as_deref()
+                .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+                .map_or(0, |t| t.timestamp());
+            let mut row = json!({
+                "type": "model", "id": m.id, "display_name": m.display_name,
+                "object": "model", "created": created, "owned_by": "anthropic",
+            });
             if let Some(c) = m.created_at {
                 row["created_at"] = json!(c);
             }
             row
         })
         .collect();
-    Json(json!({"data": data, "has_more": false})).into_response()
+    Json(json!({"object": "list", "data": data, "has_more": false})).into_response()
 }

@@ -10,11 +10,13 @@ pub mod http;
 pub mod login;
 pub mod oauth;
 mod onboard;
+pub mod openai;
 pub mod policy;
 pub mod pool;
 pub mod provider;
 pub mod quota;
 pub mod rewrite;
+pub mod routing;
 pub mod secret;
 pub mod stats;
 pub mod store;
@@ -31,6 +33,7 @@ use crate::login::LoginManager;
 use crate::oauth::OAuthClient;
 use crate::policy::Engine;
 use crate::pool::AccountPool;
+use crate::routing::ModelRouter;
 use crate::secret::SecretBox;
 use crate::stats::Recorder;
 use crate::store::Store;
@@ -53,6 +56,7 @@ pub struct Core {
     pub upstream: Upstream,
     pub catalog: Catalog,
     pub login: LoginManager,
+    pub routing: ModelRouter,
     /// Guards [`Core::start_background`].
     background: Arc<std::sync::Once>,
 }
@@ -98,6 +102,7 @@ impl Core {
                 recorder: Recorder::new(store.clone()),
                 catalog: Catalog::new(upstream.clone()),
                 login: LoginManager::new(&config.upstream),
+                routing: ModelRouter::new(store.clone(), config.routing.clone()),
                 background: Arc::new(std::sync::Once::new()),
                 upstream,
                 config: Arc::new(config),

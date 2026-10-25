@@ -657,6 +657,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "rand 0.8.8",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

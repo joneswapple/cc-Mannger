@@ -194,6 +194,9 @@ pub enum ModelsCommand {
     Disable { models: Vec<String> },
     /// Refetch the model catalog from upstream.
     Refresh,
+    /// Replace the model routes: `pattern=target` pairs in match order
+    /// (`re:` prefix for a regex). No pairs clears them.
+    Routes { routes: Vec<String> },
 }
 
 pub async fn run(args: AdminArgs) -> Result<()> {
@@ -357,6 +360,21 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             c.post(
                 "/admin/api/settings/disabled-models",
                 json!({"models": models}),
+            )
+            .await?
+        }
+        AdminCommand::Models(ModelsCommand::Routes { routes }) => {
+            let routes: Vec<Value> = routes
+                .iter()
+                .map(|r| {
+                    r.split_once('=')
+                        .map(|(p, t)| json!({"pattern": p.trim(), "target": t.trim()}))
+                        .with_context(|| format!("route {r:?} is not pattern=target"))
+                })
+                .collect::<Result<_>>()?;
+            c.post(
+                "/admin/api/settings/model-routes",
+                json!({"routes": routes}),
             )
             .await?
         }

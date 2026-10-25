@@ -50,6 +50,7 @@ pub fn router(core: Core) -> Router {
     Router::new()
         .route("/v1/messages", post(proxy::messages))
         .route("/v1/messages/count_tokens", post(proxy::count_tokens))
+        .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::models))
         .route("/register", post(admin::register))
         .route("/oauth/callback", get(admin::oauth_callback))

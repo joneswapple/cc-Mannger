@@ -16,6 +16,7 @@ use crate::accounts::{AccountPatch, NotFound};
 use crate::auth::InviteError;
 use crate::login::LoginIntent;
 use crate::policy::Policy;
+use crate::routing::ModelRoute;
 use crate::stats::SearchFilter;
 use crate::Core;
 
@@ -41,6 +42,7 @@ pub(super) fn routes() -> Router<Core> {
         .route("/settings", get(settings))
         .route("/settings/disabled-models", post(set_disabled_models))
         .route("/settings/refresh-models", post(refresh_models))
+        .route("/settings/model-routes", post(set_model_routes))
         .route("/stats", get(stats))
         .route("/usage", get(usage))
 }
@@ -415,6 +417,8 @@ async fn settings(_: AdminAuth, State(core): State<Core>) -> ApiResult {
     let up = &core.config.upstream;
     Ok(Json(json!({
         "disabled_models": core.policy.disabled_models().map_err(internal)?,
+        "model_routes": core.routing.routes().map_err(internal)?,
+        "routing": core.config.routing,
         "models": core.catalog.models(),
         "catalog": core.catalog.status(),
         "upstream": {
@@ -445,6 +449,23 @@ async fn set_disabled_models(
     core.policy
         .set_disabled_models(&req.models)
         .map_err(internal)?;
+    Ok(no_content())
+}
+
+#[derive(Deserialize)]
+struct ModelRoutesRequest {
+    #[serde(default)]
+    routes: Vec<ModelRoute>,
+}
+
+async fn set_model_routes(
+    _: AdminAuth,
+    State(core): State<Core>,
+    Json(req): Json<ModelRoutesRequest>,
+) -> ApiResult {
+    core.routing
+        .set_routes(&req.routes)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(no_content())
 }
 

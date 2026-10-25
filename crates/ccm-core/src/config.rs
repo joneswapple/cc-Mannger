@@ -18,7 +18,28 @@ pub struct Config {
     pub secret_key: String,
     pub upstream: UpstreamConfig,
     pub pool: PoolConfig,
+    pub routing: RoutingConfig,
     pub admin: AdminConfig,
+}
+
+/// Model rewriting beyond the editable route list (see `routing.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// Send small, tool-less requests (titles, summaries) to this model;
+    /// empty disables the rule.
+    pub background_model: String,
+    /// "Small" means `max_tokens` at or below this.
+    pub background_max_tokens: i64,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            background_model: String::new(),
+            background_max_tokens: 512,
+        }
+    }
 }
 
 /// How requests are spread over upstream accounts and retried.
@@ -163,6 +184,7 @@ impl Default for Config {
             secret_key: String::new(),
             upstream: UpstreamConfig::default(),
             pool: PoolConfig::default(),
+            routing: RoutingConfig::default(),
             admin: AdminConfig::default(),
         }
     }
