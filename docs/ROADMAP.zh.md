@@ -6,11 +6,14 @@ cliproxy，但**只针对 Claude**，并保持本仓库现有的约束：单个 
 SQLite 内嵌、服务端渲染的 `/admin/` 面板、Anthropic 错误格式、配置优先级
 （默认值 → YAML → `CLIPROXY_*` 环境变量）。
 
+**范围说明**：本项目仅用于个人实现与测试，只支持 Claude Pro/Max OAuth 账号，
+**不实现 Anthropic API Key 账号类型**。
+
 ## 1. 功能对照
 
 | Antigravity-Manager                    | cliproxy 现状                         | 目标（Claude 版）                                                                 |
 | -------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------- |
-| 多账号池（列表 / 网格视图）            | 只读一个 `~/.claude/.credentials.json` | `accounts` 表，支持 Claude Pro/Max OAuth 账号 + Anthropic API Key 账号            |
+| 多账号池（列表 / 网格视图）            | 只读一个 `~/.claude/.credentials.json` | `accounts` 表，仅支持 Claude Pro/Max OAuth 账号（不支持 API Key）                 |
 | OAuth 授权链接 + 回调 / 手动继续       | 依赖宿主机先 `claude /login`          | 内置 PKCE 登录：生成授权链接 → 回调或手动粘贴 code → 自动入库                    |
 | 单条 / JSON 批量导入、V1 迁移          | 无                                    | 导入 `.credentials.json`、JSON 批量、macOS Keychain；旧单账号配置自动迁为账号 #1 |
 | 配额监控、最佳账号推荐、一键切换       | 无                                    | 采集 5h / 7d 用量与重置时间，面板展示，按剩余额度排序，支持手动置顶 / 固定       |
@@ -33,7 +36,7 @@ SQLite 内嵌、服务端渲染的 `/admin/` 面板、Anthropic 错误格式、�
 目标：把"一个凭据文件"变成"数据库里的若干账号"，行为与现在完全一致。
 
 - `internal/store/migrations/002_accounts.sql`
-  - `accounts(id, label, kind['oauth'|'api_key'], email, org_uuid, plan, priority,
+  - `accounts(id, label, email, org_uuid, plan, priority,
     weight, enabled, status, status_reason, proxy_url, created_at, updated_at)`
   - `account_secrets(account_id, access_token_enc, refresh_token_enc, expires_at, scopes)`
   - `usage_events` 增加 `account_id` 列（可空，兼容旧数据）
@@ -41,7 +44,6 @@ SQLite 内嵌、服务端渲染的 `/admin/` 面板、Anthropic 错误格式、�
 - `internal/upstream`
   - 新的 `Account` 类型与 `AccountStore`（读写 + 加密）。
   - `OAuthAccountProvider`：从 `ClaudeCLIProvider` 拆出刷新逻辑，存储改为 DB；刷新加单账号互斥锁。
-  - `APIKeyProvider`：`x-api-key` 认证，不加 OAuth beta、不注入 Claude Code system 块。
   - `Client.do` 改为接收"已选中的账号"而不是全局 `Provider`。
 - 启动迁移：若 `accounts` 为空且能找到旧的 credentials 文件，则导入为账号 #1，
   并保留"回写 credentials 文件"的兼容开关（宿主 `claude` 仍在用同一份 token 时需要）。
@@ -73,7 +75,7 @@ SQLite 内嵌、服务端渲染的 `/admin/` 面板、Anthropic 错误格式、�
   - `POST /admin/api/accounts/oauth/start` → 返回授权链接 + state
   - `GET  /admin/oauth/callback`（本机回调）与 `POST /admin/api/accounts/oauth/complete`（手动粘贴 `code#state`）
   - 换 token 后拉取 profile（邮箱、组织、套餐）写入 `accounts`
-- 导入：`POST /admin/api/accounts/import`（单个 credentials JSON、JSON 数组批量、API Key）；
+- 导入：`POST /admin/api/accounts/import`（单个 credentials JSON、JSON 数组批量）；
   CLI 额外支持 `--from-keychain`（macOS 下调 `security`，不引入 CGO）。
 - 账号操作：启用 / 禁用 / 改优先级 / 改标签 / 改代理 / 强制刷新 token / 删除 / 置为首选。
 - CLI：`cliproxy admin account {list,add,login,import,enable,disable,pin,refresh,rm}`。
@@ -124,14 +126,13 @@ SQLite 内嵌、服务端渲染的 `/admin/` 面板、Anthropic 错误格式、�
 ## 4. 风险与需要确认的问题
 
 1. **服务条款风险**：Anthropic 消费者条款不允许共享 / 转售 Pro/Max 订阅，多账号轮换以绕过
-   单账号限额可能导致封号。建议只用于自己或团队自有账号；API Key 账号是官方支持的方式，
-   作为一等公民实现。
+   单账号限额可能导致封号。本项目定位为个人实现与测试用途，只接入自己的 OAuth 账号，
+   不做 API Key 账号。
 2. **非官方接口**：OAuth 授权 / token / profile / 用量接口和 `anthropic-ratelimit-unified-*`
    响应头都没有公开文档，全部做成可配置项，并用 fake server 测试，随时可能需要跟进调整。
 3. **与宿主 `claude` 共用 token**：同一个 refresh token 被两边轮换会互相踢掉。阶段 0 保留
    "回写 credentials 文件"兼容模式；新登录的账号建议只给 cliproxy 用。
 4. **待你确认**：
    - 是否需要 OpenAI 兼容（阶段 4 的大头），还是只服务 Claude Code 客户端？
-   - 是否需要 API Key 账号与 OAuth 账号混合调度（计费方式不同）？
    - 默认调度策略选"粘性优先"（保 cache）还是"用量均衡"？
    - 是否需要 Bedrock / Vertex 账号（`CredentialProvider` 接口已预留）？
