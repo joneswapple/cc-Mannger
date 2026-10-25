@@ -1,18 +1,54 @@
 name: Release
 
-# Push a tag like v0.1.0 to build the desktop installers and ccm-server
-# binaries into a draft GitHub release.
+# Push a tag like v0.1.0 (or run this workflow by hand with a tag name) to
+# build the desktop installers, ccm-server binaries and the Docker image
+# into a draft GitHub release. Publishing the draft creates the tag when it
+# doesn't exist yet.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.0 (built from the selected branch)
+        required: true
 
 permissions:
   contents: write
   packages: write
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
+  # One draft release for every build job to upload into, so parallel jobs
+  # don't each create their own.
+  release:
+    runs-on: ubuntu-22.04
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    steps:
+      - id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::tag '$TAG' does not look like vX.Y.Z"
+            exit 1
+          fi
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id")
+          id=${ids%%$'\n'*}
+          if [ -z "$id" ]; then
+            id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" \
+              -f name="CC Manager $TAG" -F draft=true -F generate_release_notes=true \
+              --jq .id)
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
   desktop:
+    needs: release
     strategy:
       fail-fast: false
       matrix:
@@ -45,13 +81,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: CC Manager ${{ github.ref_name }}
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.release.outputs.id }}
           args: ${{ matrix.args }}
 
   server:
+    needs: release
     strategy:
       fail-fast: false
       matrix:
@@ -87,11 +121,12 @@ jobs:
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: Compress-Archive -Path target/${{ matrix.target }}/release/ccm-server.exe -DestinationPath ccm-server-${{ matrix.target }}.zip
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          draft: true
-          files: ccm-server-${{ matrix.target }}.*
+      - name: Upload to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" ccm-server-${{ matrix.target }}.* --clobber
 
   docker:
     runs-on: ubuntu-22.04
@@ -108,7 +143,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/cc-manager
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},value=${{ env.TAG }}
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
