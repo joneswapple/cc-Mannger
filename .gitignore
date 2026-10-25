@@ -1,0 +1,9 @@
+/cliproxy
+/dist/
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+config.yaml
+!config.example.yaml

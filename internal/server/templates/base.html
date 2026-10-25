@@ -1,0 +1,24 @@
+{{define "base"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{.Title}} — CliProxy</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">CliProxy</div>
+  <nav>
+    <a href="/admin/users" class="{{if eq .Active "users"}}active{{end}}">Users</a>
+    <a href="/admin/invites" class="{{if eq .Active "invites"}}active{{end}}">Invites</a>
+    <a href="/admin/stats" class="{{if eq .Active "stats"}}active{{end}}">Stats</a>
+    <a href="/admin/settings" class="{{if eq .Active "settings"}}active{{end}}">Settings</a>
+    <form action="/admin/logout" method="post" class="logout"><button type="submit">Sign out</button></form>
+  </nav>
+</header>
+<main>
+{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>{{end}}

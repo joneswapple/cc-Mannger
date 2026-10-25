@@ -1,0 +1,54 @@
+{{define "content"}}
+{{$content := .Content}}
+<h1>Invites</h1>
+<section class="card">
+  <h2>Create invite</h2>
+  <form id="create-invite">
+    <label>Label<input name="label" required></label>
+    <label>TTL (hours)<input name="ttl_hours" type="number" min="1" value="24"></label>
+    <button type="submit">Create</button>
+  </form>
+  <pre id="invite-result" hidden></pre>
+</section>
+
+<section class="card">
+  <h2>Existing invites</h2>
+  <table>
+    <thead><tr><th>Label</th><th>Created</th><th>Expires</th><th>Redeemed</th><th></th></tr></thead>
+    <tbody>
+    {{range $content.Invites}}
+    <tr>
+      <td>{{.Label}}</td>
+      <td>{{fmtTime .CreatedAt}}</td>
+      <td>{{fmtTime .ExpiresAt}}</td>
+      <td>{{fmtTimePtr .RedeemedAt}}</td>
+      <td>{{if not .RedeemedAt}}<button data-hash="{{.Hash}}" class="del">Delete</button>{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+
+<script>
+document.getElementById("create-invite").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const r = await fetch("/admin/api/invites", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({label: f.get("label"), ttl_hours: Number(f.get("ttl_hours"))}),
+  });
+  if (!r.ok) { alert("error: " + r.status); return; }
+  const out = await r.json();
+  const pre = document.getElementById("invite-result");
+  pre.hidden = false;
+  pre.textContent = "Token (save now, shown once):\n" + out.token + "\n\nExpires: " + out.expires_at;
+});
+document.querySelectorAll("button.del").forEach(b => {
+  b.addEventListener("click", async () => {
+    if (!confirm("Delete invite?")) return;
+    const r = await fetch(`/admin/api/invites/${b.dataset.hash}/delete`, {method:"POST"});
+    if (r.ok) location.reload();
+  });
+});
+</script>
+{{end}}

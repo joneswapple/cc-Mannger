@@ -1,0 +1,83 @@
+# cliproxy sample configuration.
+#
+# Copy to config.yaml (or any path you pass to `--config`), edit, and start
+# the server with:
+#
+#   ./cliproxy serve --config ./config.yaml
+#
+# Every option is also overridable via CLIPROXY_* environment variables.
+# Order of precedence: defaults → this YAML → CLIPROXY_* env vars.
+
+# Address the proxy listens on. Use 0.0.0.0 to expose it to the LAN, or
+# 127.0.0.1 if you're terminating TLS in a reverse proxy on the same host.
+listen: "0.0.0.0:8787"
+
+# Where the SQLite database (cliproxy.db) and any other state will live.
+# `~` is expanded to the current user's home directory.
+data_dir: "~/.local/share/cliproxy"
+
+# debug | info | warn | error
+log_level: "info"
+
+upstream:
+  # The Anthropic API base URL. Almost always the default.
+  base_url: "https://api.anthropic.com"
+
+  # Path to the Claude Code CLI credentials file produced by `claude /login`.
+  # Leave blank to auto-detect in this order:
+  #   1. $CLAUDE_CREDENTIALS_PATH
+  #   2. $CLAUDE_CONFIG_DIR/.credentials.json
+  #   3. $HOME/.claude/.credentials.json
+  # On macOS the tokens live in the keychain; export them once with:
+  #   security find-generic-password -s "Claude Code-credentials" -w \
+  #     > ~/.claude/.credentials.json
+  # and point this option at the resulting file.
+  credentials_path: ""
+
+  # OAuth refresh endpoint and CLI client ID. These are not officially
+  # documented; the defaults match what the public Claude Code CLI uses
+  # today. Override here if Anthropic changes the contract.
+  oauth_token_url: "https://console.anthropic.com/v1/oauth/token"
+  oauth_client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+  # Beta header(s) that must be sent for OAuth-bearer-token requests against
+  # api.anthropic.com. `claude-code-20250219` enables the Pro/Max surface
+  # and `oauth-2025-04-20` is the OAuth token grant flag — both required.
+  # Comma-separated; Anthropic accepts multiple values.
+  anthropic_beta: "claude-code-20250219,oauth-2025-04-20"
+
+  # User-Agent the proxy sends upstream. Mimicking Claude Code is the safest
+  # default; change it if you need to identify your deployment differently.
+  user_agent: "claude-cli/1.0 (cliproxy)"
+
+  # Anthropic's OAuth Pro/Max endpoint rejects /v1/messages requests whose
+  # first system block isn't the literal Claude Code identifier. It returns
+  # the same terse `rate_limit_error: "Error"` shape it uses for real
+  # throttling, which trips up callers that aren't `claude` itself. When
+  # this is true (default), the proxy rewrites the request body so the
+  # identifier is the first system block, while leaving any pre-existing
+  # system content in place after it. Disable only if your upstream client
+  # already prepends the identifier and you want byte-for-byte passthrough.
+  inject_claude_code_system: true
+
+  # OpenAI-compatible "effort" tier → Anthropic max_tokens + extended-
+  # thinking budget. When a /v1/messages request includes
+  # `"effort": "<tier>"`, cliproxy expands it to the matching values
+  # below before forwarding (and strips the `effort` field — Anthropic
+  # doesn't recognise it). Any explicit `max_tokens` or `thinking` already
+  # in the request always wins over the tier defaults. To disable the
+  # alias entirely set `effort_levels: {}`.
+  effort_levels:
+    auto:   { max_tokens: 8192 }
+    low:    { max_tokens: 4096 }
+    medium: { max_tokens: 16384, thinking_budget: 5000 }
+    high:   { max_tokens: 32768, thinking_budget: 15000 }
+    xhigh:  { max_tokens: 48000, thinking_budget: 30000 }
+    max:    { max_tokens: 64000, thinking_budget: 60000 }
+
+admin:
+  # If set, this exact string is installed as the admin token (after hashing).
+  # If blank, on first run cliproxy generates a random token and prints it
+  # to stdout — save it. You can rotate it at any time by setting this and
+  # restarting.
+  initial_token: ""
