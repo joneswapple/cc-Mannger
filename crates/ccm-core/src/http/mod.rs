@@ -2,6 +2,7 @@
 //! registration, and the admin JSON API under `/admin/api`.
 
 mod admin;
+mod insights;
 mod ops;
 mod proxy;
 
@@ -284,6 +285,11 @@ impl FromRequestParts<Core> for ApiIdentity {
                 StatusCode::UNAUTHORIZED,
                 "authentication_error",
                 "api key revoked",
+            )),
+            Err(KeyError::Expired) => Err(anthropic_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "api key expired — ask the CC Manager admin to renew it",
             )),
             Err(KeyError::UserDisabled) => Err(anthropic_error(
                 StatusCode::FORBIDDEN,

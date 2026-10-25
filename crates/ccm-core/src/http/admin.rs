@@ -23,6 +23,7 @@ use crate::Core;
 pub(super) fn routes() -> Router<Core> {
     Router::new()
         .merge(super::ops::routes())
+        .merge(super::insights::routes())
         .route("/status", get(status))
         .route("/users", get(list_users).post(create_user))
         .route("/users/:id/enable", post(enable_user))
@@ -98,15 +99,38 @@ struct UserView {
     #[serde(flatten)]
     user: crate::auth::UserKeys,
     policy: Policy,
+    today_requests: i64,
+    today_tokens: i64,
 }
 
-async fn list_users(_: AdminAuth, State(core): State<Core>) -> ApiResult {
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct UsersQuery {
+    /// Minutes east of UTC, so "today" means the viewer's day.
+    tz_offset: i64,
+}
+
+async fn list_users(
+    _: AdminAuth,
+    State(core): State<Core>,
+    Query(q): Query<UsersQuery>,
+) -> ApiResult {
     let users = core.keys.list_users().map_err(internal)?;
+    let offset = q.tz_offset.clamp(-14 * 60, 14 * 60) * 60;
+    let now = crate::now_unix();
+    let midnight = (now + offset).div_euclid(86_400) * 86_400 - offset;
+    let today = core.analytics.per_user_since(midnight).map_err(internal)?;
     let out = users
         .into_iter()
         .map(|u| {
             let policy = core.policy.get_policy(u.id)?;
-            Ok(UserView { user: u, policy })
+            let (requests, tokens) = today.get(&u.id).copied().unwrap_or_default();
+            Ok(UserView {
+                user: u,
+                policy,
+                today_requests: requests,
+                today_tokens: tokens,
+            })
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(internal)?;
@@ -167,6 +191,9 @@ async fn set_policy(
 struct IssueKeyRequest {
     #[serde(default)]
     user_id: i64,
+    /// Optional lifetime in days; absent or 0 never expires.
+    #[serde(default)]
+    ttl_days: i64,
 }
 
 async fn issue_key(
@@ -181,7 +208,8 @@ async fn issue_key(
         return Err(json_error(StatusCode::NOT_FOUND, "user not found"));
     }
     let keys = core.keys.clone();
-    let (key, id) = blocking(move || keys.issue(req.user_id))
+    let expires = (req.ttl_days > 0).then(|| crate::now_unix() + req.ttl_days * 86_400);
+    let (key, id) = blocking(move || keys.issue_until(req.user_id, expires))
         .await
         .map_err(internal)?;
     Ok(Json(json!({"api_key": key, "key_id": id})).into_response())

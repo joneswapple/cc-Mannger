@@ -1734,3 +1734,196 @@ async fn claude_code_sync_writes_a_working_key_and_restores() {
         .await;
     assert_eq!(s, 400);
 }
+
+/// A messages call that appears to come from `ip` (as the real listener's
+/// connect info would say), with extra headers.
+async fn from_ip(h: &Harness, key: &str, ip: &str, extra: &[(&str, &str)]) -> (StatusCode, Value) {
+    let mut b = Request::post("/v1/messages")
+        .header("x-api-key", key)
+        .header("content-type", "application/json");
+    for (k, v) in extra {
+        b = b.header(*k, *v);
+    }
+    let mut req = b.body(Body::from(r#"{"model":"claude-test"}"#)).unwrap();
+    let addr: std::net::SocketAddr = format!("{ip}:50000").parse().unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    let (status, _, body) = h.call(req).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn key_expiry_and_renewal() {
+    let h = harness().await;
+    let (s, k) = h
+        .admin(
+            "POST",
+            "/admin/api/keys/issue",
+            Some(json!({"user_id": h.user_id, "ttl_days": 3})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let key = k["api_key"].as_str().unwrap().to_string();
+    let key_id = k["key_id"].as_i64().unwrap();
+    assert_eq!(bearer_status(&h, &key).await, 200);
+    let (_, users) = h.admin("GET", "/admin/api/users", None).await;
+    let exp = users["users"][0]["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == key_id)
+        .unwrap()["expires_at"]
+        .as_i64()
+        .unwrap();
+    assert!((exp - ccm_core_now() - 3 * 86_400).abs() < 60);
+
+    // Expired keys are rejected even when the lookup is cached.
+    h.admin(
+        "POST",
+        &format!("/admin/api/keys/{key_id}/expiry"),
+        Some(json!({"expires_at": ccm_core_now() - 1})),
+    )
+    .await;
+    let req = Request::post("/v1/messages")
+        .header("x-api-key", &key)
+        .body(Body::from(r#"{"model":"claude-test"}"#))
+        .unwrap();
+    let (status, _, body) = h.call(req).await;
+    assert_eq!(status, 401);
+    assert!(json(&body)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
+    let (s, _) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/keys/{key_id}/expiry"),
+            Some(json!({"days": 0})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(bearer_status(&h, &key).await, 200, "cleared expiry");
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/keys/999/expiry",
+            Some(json!({"days": 1})),
+        )
+        .await;
+    assert_eq!(s, 404);
+}
+
+#[tokio::test]
+async fn ip_limit_tracks_distinct_ips_per_terminal() {
+    let h = harness().await;
+    let (s, _) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/users/{}/policy", h.user_id),
+            Some(json!({"max_ips": 1})),
+        )
+        .await;
+    assert_eq!(s, 204);
+    let (_, p) = h
+        .admin(
+            "GET",
+            &format!("/admin/api/users/{}/policy", h.user_id),
+            None,
+        )
+        .await;
+    assert_eq!(p["max_ips"], 1);
+
+    assert_eq!(from_ip(&h, &h.api_key, "10.0.0.1", &[]).await.0, 200);
+    assert_eq!(from_ip(&h, &h.api_key, "10.0.0.1", &[]).await.0, 200);
+    let (s, e) = from_ip(&h, &h.api_key, "10.0.0.2", &[]).await;
+    assert_eq!(s, 403);
+    assert_eq!(e["error"]["type"], "permission_error");
+    // X-Forwarded-For is ignored until trusted.
+    assert_eq!(
+        from_ip(
+            &h,
+            &h.api_key,
+            "10.0.0.1",
+            &[("x-forwarded-for", "10.0.0.9")]
+        )
+        .await
+        .0,
+        200
+    );
+    h.admin(
+        "POST",
+        "/admin/api/runtime",
+        Some(json!({"security": {"trust_forwarded_for": true}})),
+    )
+    .await;
+    let (s, _) = from_ip(
+        &h,
+        &h.api_key,
+        "10.0.0.1",
+        &[("x-forwarded-for", "10.0.0.9, 10.0.0.1")],
+    )
+    .await;
+    assert_eq!(s, 403, "the forwarded client IP counts");
+
+    let (_, ips) = h
+        .admin("GET", &format!("/admin/api/users/{}/ips", h.user_id), None)
+        .await;
+    let ips = ips["ips"].as_array().unwrap();
+    assert_eq!(ips.len(), 1);
+    assert_eq!(
+        (ips[0]["ip"].clone(), ips[0]["requests"].clone()),
+        (json!("10.0.0.1"), json!(3))
+    );
+}
+
+#[tokio::test]
+async fn stats_overview_prices_and_today_counts() {
+    let h = harness().await;
+    for _ in 0..3 {
+        h.messages(r#"{"model":"claude-test"}"#, &[]).await;
+    }
+    h.core.recorder.flush();
+    let (s, o) = h
+        .admin(
+            "GET",
+            "/admin/api/stats/overview?days=1&granularity=hour&group=model&tz_offset=480",
+            None,
+        )
+        .await;
+    assert_eq!(s, 200, "{o}");
+    assert_eq!(o["totals"]["requests"], 3);
+    assert_eq!(o["totals"]["input_tokens"], 21);
+    assert_eq!(o["by_model"][0]["key"], "claude-test");
+    assert_eq!(o["series"][0]["key"], "claude-test");
+    assert_eq!(o["totals"]["cost_usd"], 0.0, "no price matches claude-test");
+    assert!(!o["heatmap"].as_array().unwrap().is_empty());
+
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/settings/prices",
+            Some(json!({"prices": [{"pattern": "claude-test", "input": 1000000.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}]})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (_, o) = h
+        .admin("GET", "/admin/api/stats/overview?days=1", None)
+        .await;
+    assert!((o["totals"]["cost_usd"].as_f64().unwrap() - 21.0).abs() < 1e-6);
+    let (s, _) = h
+        .admin("POST", "/admin/api/settings/prices", Some(json!({"prices": [{"pattern": "re:(", "input": 1.0, "output": 1.0, "cache_read": 0.0, "cache_write": 0.0}]})))
+        .await;
+    assert_eq!(s, 400);
+
+    let (_, users) = h.admin("GET", "/admin/api/users?tz_offset=0", None).await;
+    assert_eq!(users["users"][0]["today_requests"], 3);
+    assert_eq!(users["users"][0]["today_tokens"], 30);
+    let (_, mine) = h
+        .admin(
+            "GET",
+            &format!("/admin/api/stats/overview?days=1&user_id={}", h.user_id + 1),
+            None,
+        )
+        .await;
+    assert_eq!(mine["totals"]["requests"], 0);
+}

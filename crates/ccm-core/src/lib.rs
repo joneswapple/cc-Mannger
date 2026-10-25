@@ -2,6 +2,7 @@
 //! server shared by the desktop app (`src-tauri`) and `ccm-server`.
 
 pub mod accounts;
+pub mod analytics;
 pub mod auth;
 pub mod capture;
 pub mod claude_code;
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::accounts::AccountStore;
+use crate::analytics::Analytics;
 use crate::auth::{Admin, Invites, Keys};
 use crate::config::Config;
 use crate::login::LoginManager;
@@ -59,6 +61,7 @@ pub struct Core {
     pub admin: Admin,
     pub policy: Engine,
     pub recorder: Recorder,
+    pub analytics: Analytics,
     pub upstream: Upstream,
     pub catalog: Catalog,
     pub login: LoginManager,
@@ -123,6 +126,7 @@ impl Core {
                 admin: Admin::new(store.clone()),
                 policy: Engine::new(store.clone()),
                 recorder: Recorder::new(store.clone()),
+                analytics: Analytics::new(store.clone()),
                 catalog: Catalog::new(upstream.clone()),
                 login: LoginManager::new(&config.upstream),
                 routing: ModelRouter::new(store.clone(), rt.routing.clone()),

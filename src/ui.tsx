@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { fmtCountdown } from "./format";
 import { useI18n } from "./i18n";
 
@@ -19,7 +19,7 @@ export function Card({
   bodyClass?: string;
 }) {
   return (
-    <section className={`rounded-2xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 ${className}`}>
+    <section className={`min-w-0 rounded-2xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 ${className}`}>
       {(title || actions) && (
         <header className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
           <h2 className="flex items-center gap-2 text-base font-semibold">
@@ -333,15 +333,22 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[] = []) {
   const [loading, setLoading] = useState(true);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const run = useCallback(load, deps);
+  // Only the latest call may set state: a slow response for old deps must
+  // not overwrite a newer one.
+  const seq = useRef(0);
   const reload = useCallback(async () => {
+    const mine = ++seq.current;
     setLoading(true);
     try {
-      setData(await run());
+      const v = await run();
+      if (mine !== seq.current) return;
+      setData(v);
       setError(null);
     } catch (e) {
+      if (mine !== seq.current) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (mine === seq.current) setLoading(false);
     }
   }, [run]);
   useEffect(() => {

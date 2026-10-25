@@ -1,3 +1,42 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Chart roles (validated categorical order; see src/charts.tsx). Dark mode
+   uses its own steps, not a flip. */
+:root {
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-other: #a8a29e;
+  --chart-grid: #e2e8f0;
+  --chart-axis: #cbd5e1;
+  --heat-0: #f1f5f9;
+  --heat-1: #cde2fb;
+  --heat-2: #9ec5f4;
+  --heat-3: #6da7ec;
+  --heat-4: #3987e5;
+  --heat-5: #256abf;
+  --heat-6: #184f95;
+  --heat-7: #0d366b;
+}
+.dark {
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-other: #57534e;
+  --chart-grid: #1e293b;
+  --chart-axis: #334155;
+  --heat-0: #1e293b;
+  --heat-1: #0d366b;
+  --heat-2: #104281;
+  --heat-3: #184f95;
+  --heat-4: #256abf;
+  --heat-5: #3987e5;
+  --heat-6: #6da7ec;
+  --heat-7: #b7d3f6;
+}

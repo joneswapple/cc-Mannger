@@ -11,7 +11,7 @@ and OpenAI Chat Completions requests from per-terminal `sk-cp-…` keys it
 issues itself. It is a Tauri v2 desktop app plus a headless server over one
 Rust core, modelled on lbjlaq/Antigravity-Manager. Claude OAuth accounts
 only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
-(R0–R8 are done; the Go cliproxy has been removed).
+(R0–R9 are done; the Go cliproxy has been removed).
 
 ## Build / run / test
 
@@ -64,11 +64,16 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
   - `claude_code.rs` — writes / restores `~/.claude/settings.json` env
     (backup on first sync).
   - `auth/` — `sk-cp-` keys (bcrypt, 12-char prefix index, Go 8-char prefixes
-    still resolve, 60 s cache keyed by sha256), invites (sha256 only),
+    still resolve, 60 s cache keyed by sha256, optional `expires_at`
+    checked on every lookup), invites (sha256 only),
     admin token (bcrypt in `global_settings`).
-  - `policy.rs` — global denylist, allowlist, RPM bucket, daily quota.
+  - `policy.rs` — global denylist, allowlist, RPM bucket, daily quota,
+    per-terminal distinct-IP limit (`user_ips`, 24 h window).
   - `stats.rs` — `Recorder` writes on its own thread via a bounded channel
     (`flush()` for tests); rollups and the usage search.
+  - `analytics.rs` — stats-page overview (hour/day/week series grouped by
+    model/account/terminal in the viewer's time zone, rollups, heatmap)
+    and cost estimates from the editable price table.
   - `upstream.rs` — `Upstream::forward` is the failover loop: pick, send,
     record quota headers, `classify` the status (429/403 cool down, 401
     forces refresh, 5xx/529 retry, else done), never reading bodies so SSE
@@ -86,7 +91,8 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
     `/admin/api/*`, `/register`, `/oauth/callback`; `ops.rs` runtime
     settings, `/service` (listener start/stop through the host's
     `ServiceControl`), monitor, model test, Claude Code sync. `ClientIp`
-    extracts the peer (or forwarded) address.
+    extracts the peer (or forwarded) address; `insights.rs` stats
+    overview, prices, key expiry, terminal IPs.
 - `crates/ccm-server` — headless binary: `serve`, `config`, `admin …`
   (HTTP client over `/admin/api/*`, except `reset-token`), `effort …`,
   `migrate-from-go`. `build.rs` + rust-embed embed `dist/` (placeholder page

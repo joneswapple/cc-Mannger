@@ -26,6 +26,8 @@ pub enum KeyError {
     Revoked,
     #[error("user disabled")]
     UserDisabled,
+    #[error("api key expired")]
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,8 @@ pub struct Identity {
     pub user_label: String,
     pub key_id: i64,
     pub key_prefix: String,
+    /// Unix seconds after which the key stops working.
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +56,7 @@ pub struct KeyInfo {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
+    pub expires_at: Option<i64>,
 }
 
 /// Terminal API keys. Lookups are cached for a minute, keyed by the key's
@@ -117,10 +122,35 @@ impl Keys {
     /// Issues a new key for a user. Returns (plaintext key, key id); the
     /// plaintext is shown exactly once.
     pub fn issue(&self, user_id: i64) -> Result<(String, i64)> {
+        self.issue_until(user_id, None)
+    }
+
+    /// [`Keys::issue`] with an optional expiry (unix seconds).
+    pub fn issue_until(&self, user_id: i64, expires_at: Option<i64>) -> Result<(String, i64)> {
         let full = generate_key();
         let hash = bcrypt::hash(&full, BCRYPT_COST)?;
-        let id = insert_key(&self.store.conn(), user_id, &full, &hash)?;
+        let conn = self.store.conn();
+        let id = insert_key(&conn, user_id, &full, &hash)?;
+        if expires_at.is_some() {
+            conn.execute(
+                "UPDATE api_keys SET expires_at = ?1 WHERE id = ?2",
+                params![expires_at, id],
+            )?;
+        }
         Ok((full, id))
+    }
+
+    /// Sets or clears (`None`) a key's expiry, e.g. to renew it.
+    pub fn set_expiry(&self, key_id: i64, expires_at: Option<i64>) -> Result<()> {
+        let n = self.store.conn().execute(
+            "UPDATE api_keys SET expires_at = ?1 WHERE id = ?2",
+            params![expires_at, key_id],
+        )?;
+        if n == 0 {
+            bail!("key {key_id} not found");
+        }
+        self.clear_cache();
+        Ok(())
     }
 
     /// Resolves a plaintext key to its identity. CPU-heavy on a cache miss
@@ -134,6 +164,9 @@ impl Keys {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((id, expiry)) = cache.get(&digest) {
                 if Instant::now() < *expiry {
+                    if id.expires_at.is_some_and(|t| t <= crate::now_unix()) {
+                        return Err(KeyError::Expired);
+                    }
                     return Ok(id.clone());
                 }
                 cache.remove(&digest);
@@ -153,11 +186,15 @@ impl Keys {
             if !c.user_enabled {
                 return Err(KeyError::UserDisabled);
             }
+            if c.expires_at.is_some_and(|t| t <= crate::now_unix()) {
+                return Err(KeyError::Expired);
+            }
             let id = Identity {
                 user_id: c.user_id,
                 user_label: c.user_label,
                 key_id: c.key_id,
                 key_prefix: c.prefix,
+                expires_at: c.expires_at,
             };
             self.cache
                 .lock()
@@ -176,7 +213,7 @@ impl Keys {
         let conn = self.store.conn();
         let mut stmt = conn.prepare(
             "SELECT api_keys.id, api_keys.prefix, api_keys.hash, api_keys.revoked_at IS NOT NULL,
-                    users.id, users.label, users.enabled
+                    users.id, users.label, users.enabled, api_keys.expires_at
              FROM api_keys JOIN users ON users.id = api_keys.user_id
              WHERE api_keys.prefix IN (?1, ?2)",
         )?;
@@ -191,6 +228,7 @@ impl Keys {
                     user_id: r.get(4)?,
                     user_label: r.get(5)?,
                     user_enabled: r.get(6)?,
+                    expires_at: r.get(7)?,
                 })
             },
         )?;
@@ -243,7 +281,7 @@ impl Keys {
             })?
             .collect::<rusqlite::Result<_>>()?;
         let mut stmt = conn.prepare(
-            "SELECT id, prefix, created_at, last_used_at, revoked_at FROM api_keys
+            "SELECT id, prefix, created_at, last_used_at, revoked_at, expires_at FROM api_keys
              WHERE user_id = ?1 ORDER BY id",
         )?;
         for u in &mut users {
@@ -255,6 +293,7 @@ impl Keys {
                         created_at: r.get(2)?,
                         last_used_at: r.get(3)?,
                         revoked_at: r.get(4)?,
+                        expires_at: r.get(5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -271,6 +310,7 @@ struct Candidate {
     user_id: i64,
     user_label: String,
     user_enabled: bool,
+    expires_at: Option<i64>,
 }
 
 pub(crate) fn insert_key(

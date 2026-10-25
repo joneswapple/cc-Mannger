@@ -343,21 +343,27 @@ async fn dispatch_inner(
         Err(e) => return Err(Reject::bad_request(e.to_string())),
     };
 
+    let denied = |d: Denied| {
+        let (status, kind) = match d {
+            Denied::RateLimited | Denied::QuotaExceeded => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
+            }
+            Denied::ModelDisabled | Denied::ModelNotAllowed | Denied::TooManyIps(_) => {
+                (StatusCode::FORBIDDEN, "permission_error")
+            }
+        };
+        Reject::new(status, kind, d.to_string())
+    };
     let policy = match core.policy.check(id.user_id, &model) {
         Ok(Ok(p)) => p,
-        Ok(Err(denied)) => {
-            let (status, kind) = match denied {
-                Denied::RateLimited | Denied::QuotaExceeded => {
-                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
-                }
-                Denied::ModelDisabled | Denied::ModelNotAllowed => {
-                    (StatusCode::FORBIDDEN, "permission_error")
-                }
-            };
-            return Err(Reject::new(status, kind, denied.to_string()));
-        }
+        Ok(Err(d)) => return Err(denied(d)),
         Err(e) => return Err(Reject::internal(format!("policy: {e:#}"))),
     };
+    match core.policy.track_ip(id.user_id, &origin.ip, policy.max_ips) {
+        Ok(Ok(())) => {}
+        Ok(Err(d)) => return Err(denied(d)),
+        Err(e) => return Err(Reject::internal(format!("policy: {e:#}"))),
+    }
 
     let body = maybe_inject(core, body);
     if let Some(d) = draft.as_mut() {

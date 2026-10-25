@@ -15,7 +15,16 @@ use crate::store::Store;
 const SETTING_DISABLED_MODELS: &str = "disabled_models";
 
 /// allowed_models, daily_token_limit, rpm_limit, account_group
-type PolicyRow = (Option<String>, Option<i64>, Option<i64>, Option<String>);
+type PolicyRow = (
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Window in which distinct client IPs count against `max_ips`.
+pub const IP_WINDOW_SECS: i64 = 86_400;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Denied {
@@ -27,6 +36,8 @@ pub enum Denied {
     RateLimited,
     #[error("daily token quota exceeded")]
     QuotaExceeded,
+    #[error("this terminal key was already used from {0} IP addresses in the last 24 hours, the most its policy allows")]
+    TooManyIps(i64),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +49,18 @@ pub struct Policy {
     /// Restricts the user to upstream accounts in this group.
     #[serde(default)]
     pub account_group: Option<String>,
+    /// Distinct client IPs allowed per 24 hours.
+    #[serde(default)]
+    pub max_ips: Option<i64>,
+}
+
+/// One client IP a terminal has used.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserIp {
+    pub ip: String,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub requests: i64,
 }
 
 #[derive(Clone)]
@@ -59,13 +82,13 @@ impl Engine {
             .store
             .conn()
             .query_row(
-                "SELECT allowed_models, daily_token_limit, rpm_limit, account_group
+                "SELECT allowed_models, daily_token_limit, rpm_limit, account_group, max_ips
                  FROM policies WHERE user_id = ?1",
                 [user_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((allowed, daily, rpm, group)) = row else {
+        let Some((allowed, daily, rpm, group, max_ips)) = row else {
             return Ok(Policy::default());
         };
         Ok(Policy {
@@ -76,6 +99,7 @@ impl Engine {
             daily_token_limit: daily,
             rpm_limit: rpm,
             account_group: group.filter(|g| !g.is_empty()),
+            max_ips,
         })
     }
 
@@ -86,22 +110,86 @@ impl Engine {
             .map(serde_json::to_string)
             .transpose()?;
         self.store.conn().execute(
-            "INSERT INTO policies(user_id, allowed_models, daily_token_limit, rpm_limit, account_group)
-             VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO policies(user_id, allowed_models, daily_token_limit, rpm_limit, account_group, max_ips)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(user_id) DO UPDATE SET
                 allowed_models = excluded.allowed_models,
                 daily_token_limit = excluded.daily_token_limit,
                 rpm_limit = excluded.rpm_limit,
-                account_group = excluded.account_group",
+                account_group = excluded.account_group,
+                max_ips = excluded.max_ips",
             params![
                 user_id,
                 allowed,
                 p.daily_token_limit,
                 p.rpm_limit,
-                p.account_group.as_deref().map(str::trim).filter(|g| !g.is_empty())
+                p.account_group.as_deref().map(str::trim).filter(|g| !g.is_empty()),
+                p.max_ips.filter(|n| *n > 0),
             ],
         )?;
         Ok(())
+    }
+
+    /// Records that `user_id` called from `ip`, unless that would exceed
+    /// `max_ips` distinct IPs within [`IP_WINDOW_SECS`]. An IP already seen
+    /// in the window is always allowed. Empty IPs (in-process calls) are
+    /// not tracked.
+    pub fn track_ip(
+        &self,
+        user_id: i64,
+        ip: &str,
+        max_ips: Option<i64>,
+    ) -> Result<Result<(), Denied>> {
+        if ip.is_empty() {
+            return Ok(Ok(()));
+        }
+        let now = crate::now_unix();
+        let conn = self.store.conn();
+        if let Some(limit) = max_ips.filter(|n| *n > 0) {
+            let since = now - IP_WINDOW_SECS;
+            let known: bool = conn
+                .query_row(
+                    "SELECT 1 FROM user_ips WHERE user_id = ?1 AND ip = ?2 AND last_seen >= ?3",
+                    params![user_id, ip, since],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !known {
+                let used: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM user_ips WHERE user_id = ?1 AND last_seen >= ?2",
+                    params![user_id, since],
+                    |r| r.get(0),
+                )?;
+                if used >= limit {
+                    return Ok(Err(Denied::TooManyIps(used)));
+                }
+            }
+        }
+        conn.execute(
+            "INSERT INTO user_ips(user_id, ip, first_seen, last_seen, requests) VALUES(?1, ?2, ?3, ?3, 1)
+             ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen, requests = requests + 1",
+            params![user_id, ip, now],
+        )?;
+        Ok(Ok(()))
+    }
+
+    /// IPs a terminal has used, most recent first.
+    pub fn user_ips(&self, user_id: i64) -> Result<Vec<UserIp>> {
+        let conn = self.store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT ip, first_seen, last_seen, requests FROM user_ips
+             WHERE user_id = ?1 ORDER BY last_seen DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map([user_id], |r| {
+            Ok(UserIp {
+                ip: r.get(0)?,
+                first_seen: r.get(1)?,
+                last_seen: r.get(2)?,
+                requests: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn disabled_models(&self) -> Result<Vec<String>> {

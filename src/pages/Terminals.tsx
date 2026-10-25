@@ -1,17 +1,18 @@
-import { Ban, ChevronDown, ChevronRight, KeyRound, Monitor, Plus, Power, RefreshCw, Search, ShieldCheck, Ticket, Trash2 } from "lucide-react";
+import { BarChart3, Ban, CalendarPlus, ChevronDown, ChevronRight, KeyRound, Monitor, Plus, Power, RefreshCw, Search, ShieldCheck, Ticket, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { get, post } from "../api";
 import { fmtNum, fmtRelative, fmtTime } from "../format";
 import { useI18n } from "../i18n";
 import { useToast } from "../toast";
-import type { Invite, Policy, Settings, User } from "../types";
+import type { Invite, KeyInfo, Policy, Settings, User, UserIp } from "../types";
 import { Badge, Button, Card, ErrorBox, Field, IconButton, Modal, SecretOnce, Segmented, StatCard, inputBase, inputClass, useAction, useLoad } from "../ui";
+import StatsOverview from "./StatsOverview";
 
 type Tab = "users" | "invites";
 
 export default function Terminals() {
   const { t } = useI18n();
-  const users = useLoad(() => get<{ users: User[] }>("/users"));
+  const users = useLoad(() => get<{ users: User[] }>(`/users?tz_offset=${-new Date().getTimezoneOffset()}`));
   const invites = useLoad(() => get<{ invites: Invite[] }>("/invites"));
   const [tab, setTab] = useState<Tab>("users");
   const now = Date.now() / 1000;
@@ -69,6 +70,9 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
   const [secret, setSecret] = useState<{ label: string; value: string } | null>(null);
   const [creating, setCreating] = useState(false);
   const [policyFor, setPolicyFor] = useState<User | null>(null);
+  const [issueFor, setIssueFor] = useState<User | null>(null);
+  const [renew, setRenew] = useState<KeyInfo | null>(null);
+  const [detailFor, setDetailFor] = useState<User | null>(null);
   const act = useAction();
 
   const run = async (fn: () => Promise<unknown>, ok?: string) => {
@@ -77,11 +81,6 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
     await reload();
   };
 
-  const issueKey = async (u: User) => {
-    const r = await act.run(() => post<{ api_key: string }>("/keys/issue", { user_id: u.id }));
-    if (r) setSecret({ label: t("terminals.new_key", { name: u.label }), value: r.api_key });
-    await reload();
-  };
 
   const toggleOpen = (id: number) => {
     const next = new Set(open);
@@ -124,6 +123,7 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
                 <th>{t("terminals.status")}</th>
                 <th>{t("terminals.policy")}</th>
                 <th>{t("terminals.keys")}</th>
+                <th>{t("terminals.today")}</th>
                 <th>{t("terminals.created")}</th>
                 <th className="pr-4 text-right">{t("common.actions")}</th>
               </tr>
@@ -153,13 +153,20 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
                       <span className="font-medium">{live.length}</span>
                       <span className="text-slate-400"> / {u.keys.length}</span>
                     </td>
+                    <td className="whitespace-nowrap text-xs">
+                      <span className="font-medium">{t("usage.times", { n: u.today_requests })}</span>
+                      <span className="text-slate-400"> · {fmtNum(u.today_tokens)}</span>
+                    </td>
                     <td className="whitespace-nowrap text-xs text-slate-500">{fmtTime(u.created_at)}</td>
                     <td className="pr-4">
                       <div className="flex justify-end gap-0.5">
+                        <IconButton title={t("terminals.usage")} onClick={() => setDetailFor(u)}>
+                          <BarChart3 className="h-4 w-4" />
+                        </IconButton>
                         <IconButton title={t("terminals.policy")} onClick={() => setPolicyFor(u)}>
                           <ShieldCheck className="h-4 w-4" />
                         </IconButton>
-                        <IconButton title={t("terminals.issue_key")} disabled={act.busy} onClick={() => issueKey(u)}>
+                        <IconButton title={t("terminals.issue_key")} disabled={act.busy} onClick={() => setIssueFor(u)}>
                           <KeyRound className="h-4 w-4" />
                         </IconButton>
                         <IconButton
@@ -175,13 +182,14 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
                   open.has(u.id) && (
                     <tr key={`${u.id}-keys`} className="bg-slate-50/60 dark:bg-slate-950/40">
                       <td />
-                      <td colSpan={6} className="py-2 pr-4">
+                      <td colSpan={7} className="py-2 pr-4">
                         <table className="w-full text-left text-xs">
                           <thead className="text-slate-400">
                             <tr>
                               <th className="py-1">{t("terminals.key")}</th>
                               <th>{t("terminals.created")}</th>
                               <th>{t("terminals.last_used")}</th>
+                              <th>{t("terminals.expires")}</th>
                               <th>{t("terminals.status")}</th>
                               <th />
                             </tr>
@@ -192,8 +200,16 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
                                 <td className="py-1.5 font-mono">{k.prefix}…</td>
                                 <td>{fmtTime(k.created_at)}</td>
                                 <td>{k.last_used_at ? fmtRelative(k.last_used_at) : t("common.never")}</td>
-                                <td>{k.revoked_at ? <Badge tone="red">{t("terminals.revoked")}</Badge> : <Badge tone="green">{t("terminals.valid")}</Badge>}</td>
+                                <td>{k.expires_at ? fmtTime(k.expires_at) : t("terminals.never_expires")}</td>
+                                <td>
+                                  <KeyStatus k={k} />
+                                </td>
                                 <td className="text-right">
+                                  {!k.revoked_at && (
+                                    <IconButton title={t("terminals.renew")} disabled={act.busy} onClick={() => setRenew(k)}>
+                                      <CalendarPlus className="h-4 w-4" />
+                                    </IconButton>
+                                  )}
                                   {!k.revoked_at && (
                                     <IconButton
                                       danger
@@ -216,7 +232,7 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
               })}
               {shown.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-10 text-center text-sm text-slate-400">
+                  <td colSpan={8} className="py-10 text-center text-sm text-slate-400">
                     {t("terminals.empty")}
                   </td>
                 </tr>
@@ -236,7 +252,148 @@ function UsersTab({ users, error, reload }: { users: User[]; error: string | nul
         />
       )}
       {policyFor && <PolicyModal user={policyFor} onClose={() => setPolicyFor(null)} onDone={reload} />}
+      {issueFor && (
+        <IssueKeyModal
+          user={issueFor}
+          onClose={() => setIssueFor(null)}
+          onIssued={async (key) => {
+            setSecret({ label: t("terminals.new_key", { name: issueFor.label }), value: key });
+            setIssueFor(null);
+            await reload();
+          }}
+        />
+      )}
+      {renew && <RenewModal k={renew} onClose={() => setRenew(null)} onDone={reload} />}
+      {detailFor && <TerminalDetail user={detailFor} onClose={() => setDetailFor(null)} />}
     </div>
+  );
+}
+
+function KeyStatus({ k }: { k: KeyInfo }) {
+  const { t } = useI18n();
+  const now = Date.now() / 1000;
+  if (k.revoked_at) return <Badge tone="red">{t("terminals.revoked")}</Badge>;
+  if (k.expires_at && k.expires_at <= now) return <Badge tone="red">{t("terminals.expired_key")}</Badge>;
+  if (k.expires_at && k.expires_at - now < 3 * 86400) return <Badge tone="yellow">{t("terminals.expiring", { t: fmtRelative(k.expires_at) })}</Badge>;
+  return <Badge tone="green">{t("terminals.valid")}</Badge>;
+}
+
+const TTLS = [0, 7, 30, 90, 365];
+
+function TtlSelect({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const { t } = useI18n();
+  return (
+    <select className={inputClass} value={value} onChange={(e) => onChange(Number(e.target.value))}>
+      {TTLS.map((d) => (
+        <option key={d} value={d}>
+          {d === 0 ? t("terminals.never_expires") : t("terminals.ttl_days", { n: d })}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function IssueKeyModal({ user, onClose, onIssued }: { user: User; onClose: () => void; onIssued: (key: string) => void }) {
+  const { t } = useI18n();
+  const [ttl, setTtl] = useState(0);
+  const act = useAction();
+  return (
+    <Modal title={`${t("terminals.issue_key")} · ${user.label}`} onClose={onClose}>
+      <ErrorBox error={act.error} />
+      <Field label={t("terminals.ttl")} hint={t("terminals.ttl_hint")}>
+        <TtlSelect value={ttl} onChange={setTtl} />
+      </Field>
+      <div className="flex justify-end gap-2">
+        <Button onClick={onClose}>{t("common.cancel")}</Button>
+        <Button
+          tone="primary"
+          disabled={act.busy}
+          onClick={async () => {
+            const r = await act.run(() => post<{ api_key: string }>("/keys/issue", { user_id: user.id, ttl_days: ttl }));
+            if (r) onIssued(r.api_key);
+          }}
+        >
+          {t("terminals.issue_key")}
+        </Button>
+      </div>
+    </Modal>
+  );
+}
+
+function RenewModal({ k, onClose, onDone }: { k: KeyInfo; onClose: () => void; onDone: () => Promise<void> }) {
+  const { t } = useI18n();
+  const toast = useToast();
+  const [ttl, setTtl] = useState(30);
+  const act = useAction();
+  return (
+    <Modal title={`${t("terminals.renew")} · ${k.prefix}…`} onClose={onClose}>
+      <ErrorBox error={act.error} />
+      <p className="text-sm text-slate-500">
+        {t("terminals.current_expiry")}: {k.expires_at ? fmtTime(k.expires_at) : t("terminals.never_expires")}
+      </p>
+      <Field label={t("terminals.renew_to")}>
+        <TtlSelect value={ttl} onChange={setTtl} />
+      </Field>
+      <div className="flex justify-end gap-2">
+        <Button onClick={onClose}>{t("common.cancel")}</Button>
+        <Button
+          tone="primary"
+          disabled={act.busy}
+          onClick={async () => {
+            const r = await act.run(() => post(`/keys/${k.id}/expiry`, { days: ttl }));
+            if (r !== undefined) {
+              toast("success", t("common.saved"));
+              await onDone();
+              onClose();
+            }
+          }}
+        >
+          {t("common.save")}
+        </Button>
+      </div>
+    </Modal>
+  );
+}
+
+function TerminalDetail({ user, onClose }: { user: User; onClose: () => void }) {
+  const { t } = useI18n();
+  const ips = useLoad(() => get<{ ips: UserIp[] }>(`/users/${user.id}/ips`), [user.id]);
+  const limit = user.policy.max_ips;
+  return (
+    <Modal title={t("terminals.detail_title", { name: user.label })} onClose={onClose} wide>
+      <StatsOverview userId={user.id} compact />
+      <Card title={t("terminals.ips", { n: ips.data?.ips.length ?? 0 })} bodyClass="p-0 pt-3">
+        <p className="px-5 pb-2 text-xs text-slate-500">{limit ? t("terminals.ip_limit_on", { n: limit }) : t("terminals.ip_limit_off")}</p>
+        <ErrorBox error={ips.error} />
+        <table className="w-full text-left text-sm">
+          <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-slate-950/50">
+            <tr>
+              <th className="py-2 pl-5">IP</th>
+              <th>{t("terminals.first_seen")}</th>
+              <th>{t("terminals.last_seen")}</th>
+              <th className="pr-5 text-right">{t("stats.requests")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ips.data?.ips.map((ip) => (
+              <tr key={ip.ip} className="border-t border-slate-100 dark:border-slate-800">
+                <td className="py-2 pl-5 font-mono text-xs">{ip.ip}</td>
+                <td className="text-xs text-slate-500">{fmtTime(ip.first_seen)}</td>
+                <td className="text-xs text-slate-500">{fmtRelative(ip.last_seen)}</td>
+                <td className="pr-5 text-right tabular-nums">{fmtNum(ip.requests)}</td>
+              </tr>
+            ))}
+            {ips.data?.ips.length === 0 && (
+              <tr>
+                <td colSpan={4} className="py-6 text-center text-slate-400">
+                  {t("usage.no_data")}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+    </Modal>
   );
 }
 
@@ -247,6 +404,7 @@ function PolicySummary({ p }: { p: Policy }) {
     p.rpm_limit !== null ? <Badge key="r" tone="yellow">{t("terminals.rpm", { n: p.rpm_limit })}</Badge> : null,
     p.daily_token_limit !== null ? <Badge key="d" tone="purple">{t("terminals.daily", { n: fmtNum(p.daily_token_limit) })}</Badge> : null,
     p.account_group ? <Badge key="g">{t("terminals.group", { g: p.account_group })}</Badge> : null,
+    p.max_ips ? <Badge key="ip" tone="red">{t("terminals.max_ips_badge", { n: p.max_ips })}</Badge> : null,
   ].filter(Boolean);
   if (!parts.length) return <span className="text-xs text-slate-400">{t("terminals.no_limits")}</span>;
   return <div className="flex flex-wrap gap-1">{parts}</div>;
@@ -292,6 +450,7 @@ function PolicyModal({ user, onClose, onDone }: { user: User; onClose: () => voi
   const [rpm, setRpm] = useState(p.rpm_limit?.toString() ?? "");
   const [daily, setDaily] = useState(p.daily_token_limit?.toString() ?? "");
   const [group, setGroup] = useState(p.account_group ?? "");
+  const [maxIps, setMaxIps] = useState(p.max_ips?.toString() ?? "");
   const act = useAction();
   const num = (s: string) => (s.trim() === "" ? null : Number(s));
   const known = settings.data?.models.map((m) => m.id) ?? [];
@@ -322,9 +481,14 @@ function PolicyModal({ user, onClose, onDone }: { user: User; onClose: () => voi
           <input className={inputClass} type="number" min={1} value={daily} onChange={(e) => setDaily(e.target.value)} />
         </Field>
       </div>
-      <Field label={t("terminals.group_label")} hint={t("terminals.group_hint")}>
-        <input className={inputClass} value={group} onChange={(e) => setGroup(e.target.value)} />
-      </Field>
+      <div className="grid grid-cols-2 gap-2">
+        <Field label={t("terminals.group_label")} hint={t("terminals.group_hint")}>
+          <input className={inputClass} value={group} onChange={(e) => setGroup(e.target.value)} />
+        </Field>
+        <Field label={t("terminals.max_ips")} hint={t("terminals.max_ips_hint")}>
+          <input className={inputClass} type="number" min={1} value={maxIps} onChange={(e) => setMaxIps(e.target.value)} />
+        </Field>
+      </div>
       <div className="flex justify-end gap-2">
         <Button onClick={onClose}>{t("common.cancel")}</Button>
         <Button
@@ -337,6 +501,7 @@ function PolicyModal({ user, onClose, onDone }: { user: User; onClose: () => voi
                 rpm_limit: num(rpm),
                 daily_token_limit: num(daily),
                 account_group: group.trim() || null,
+                max_ips: num(maxIps),
               }),
             );
             if (r !== undefined) {

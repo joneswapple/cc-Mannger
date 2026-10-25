@@ -52,6 +52,7 @@ export interface Policy {
   daily_token_limit: number | null;
   rpm_limit: number | null;
   account_group: string | null;
+  max_ips?: number | null;
 }
 
 export interface KeyInfo {
@@ -60,6 +61,7 @@ export interface KeyInfo {
   created_at: number;
   last_used_at: number | null;
   revoked_at: number | null;
+  expires_at: number | null;
 }
 
 export interface User {
@@ -69,6 +71,8 @@ export interface User {
   created_at: number;
   keys: KeyInfo[];
   policy: Policy;
+  today_requests: number;
+  today_tokens: number;
 }
 
 export interface Invite {
@@ -241,4 +245,39 @@ export interface ClaudeCodeStatus {
   base_url: string | null;
   has_token: boolean;
   backup: boolean;
+}
+
+export interface TokenTotals {
+  requests: number;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
+}
+
+export interface Overview {
+  days: number;
+  series: (TokenTotals & { bucket: string; key: string })[];
+  by_model: (TokenTotals & { key: string })[];
+  by_account: (TokenTotals & { key: string })[];
+  by_user: (TokenTotals & { key: string })[];
+  totals: TokenTotals;
+  heatmap: { weekday: number; hour: number; requests: number; tokens: number }[];
+}
+
+export interface Price {
+  pattern: string;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+}
+
+export interface UserIp {
+  ip: string;
+  first_seen: number;
+  last_seen: number;
+  requests: number;
 }

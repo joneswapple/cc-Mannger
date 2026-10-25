@@ -348,12 +348,12 @@ fn status_where(s: &str) -> Option<(&'static str, Option<i64>)> {
 
 fn sort_clause(s: &str) -> &'static str {
     match s {
-        "time_asc" => "e.id ASC",
+        "time_asc" => "e.ts ASC, e.id ASC",
         "tokens_desc" => "(e.input_tokens + e.output_tokens) DESC, e.id DESC",
         "tokens_asc" => "(e.input_tokens + e.output_tokens) ASC, e.id ASC",
         "latency_desc" => "e.latency_ms DESC, e.id DESC",
         "latency_asc" => "e.latency_ms ASC, e.id ASC",
-        _ => "e.id DESC",
+        _ => "e.ts DESC, e.id DESC",
     }
 }
 

@@ -58,6 +58,23 @@ pub enum AdminCommand {
         #[arg(long, default_value_t = 50)]
         page_size: i64,
     },
+    /// Usage overview: series, rollups with estimated cost, heatmap.
+    Overview {
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        /// hour | day | week
+        #[arg(long, default_value = "day")]
+        granularity: String,
+        /// none | model | account | user
+        #[arg(long, default_value = "none")]
+        group: String,
+        #[arg(long)]
+        user_id: Option<i64>,
+    },
+    /// Show the price table used for cost estimates, or replace it with a
+    /// JSON array of {pattern,input,output,cache_read,cache_write} (USD per
+    /// million tokens); '[]' restores the defaults.
+    Prices { set: Option<String> },
     /// Show runtime settings, or apply a JSON merge patch to them
     /// (e.g. '{"pool":{"strategy":"least_used"}}'; null resets a field).
     Settings { patch: Option<String> },
@@ -159,6 +176,13 @@ pub enum UserCommand {
         /// Only use upstream accounts in this group; empty string clears it.
         #[arg(long)]
         group: Option<String>,
+        /// Distinct client IPs allowed per 24 hours.
+        #[arg(long)]
+        max_ips: Option<i64>,
+    },
+    /// Client IPs a user's keys have been used from.
+    Ips {
+        id: i64,
     },
 }
 
@@ -167,6 +191,15 @@ pub enum KeyCommand {
     /// Issue a new key for a user (shown once).
     Issue {
         user_id: i64,
+        /// Expire the key after this many days (default: never).
+        #[arg(long)]
+        ttl_days: Option<i64>,
+    },
+    /// Set a key to expire this many days from now (0 = never).
+    Renew {
+        id: i64,
+        #[arg(long)]
+        days: i64,
     },
     Revoke {
         id: i64,
@@ -297,9 +330,15 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             daily_tokens,
             rpm,
             group,
+            max_ips,
         }) => {
             let path = format!("/admin/api/users/{id}/policy");
-            if allow.is_none() && daily_tokens.is_none() && rpm.is_none() && group.is_none() {
+            if allow.is_none()
+                && daily_tokens.is_none()
+                && rpm.is_none()
+                && group.is_none()
+                && max_ips.is_none()
+            {
                 c.get(&path).await?
             } else {
                 let allowed: Option<Vec<String>> =
@@ -309,13 +348,26 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                             .filter(|m| !m.is_empty())
                             .collect()
                     });
-                c.post(&path, json!({"allowed_models": allowed, "daily_token_limit": daily_tokens, "rpm_limit": rpm, "account_group": group}))
+                c.post(&path, json!({"allowed_models": allowed, "daily_token_limit": daily_tokens, "rpm_limit": rpm, "account_group": group, "max_ips": max_ips}))
                     .await?
             }
         }
-        AdminCommand::Key(KeyCommand::Issue { user_id }) => {
-            c.post("/admin/api/keys/issue", json!({"user_id": user_id}))
-                .await?
+        AdminCommand::User(UserCommand::Ips { id }) => {
+            c.get(&format!("/admin/api/users/{id}/ips")).await?
+        }
+        AdminCommand::Key(KeyCommand::Issue { user_id, ttl_days }) => {
+            c.post(
+                "/admin/api/keys/issue",
+                json!({"user_id": user_id, "ttl_days": ttl_days.unwrap_or(0)}),
+            )
+            .await?
+        }
+        AdminCommand::Key(KeyCommand::Renew { id, days }) => {
+            c.post(
+                &format!("/admin/api/keys/{id}/expiry"),
+                json!({"days": days}),
+            )
+            .await?
         }
         AdminCommand::Key(KeyCommand::Revoke { id }) => {
             c.post(&format!("/admin/api/keys/{id}/revoke"), Value::Null)
@@ -462,6 +514,29 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             query.extend(model.map(|v| ("model", v)));
             query.extend(status.map(|v| ("status", v)));
             c.get_query("/admin/api/usage", &query).await?
+        }
+        AdminCommand::Overview {
+            days,
+            granularity,
+            group,
+            user_id,
+        } => {
+            let mut q = vec![
+                ("days", days.to_string()),
+                ("granularity", granularity),
+                ("group", group),
+            ];
+            q.extend(user_id.map(|u| ("user_id", u.to_string())));
+            c.get_query("/admin/api/stats/overview", &q).await?
+        }
+        AdminCommand::Prices { set: None } => c.get("/admin/api/settings/prices").await?,
+        AdminCommand::Prices {
+            set: Some(json_text),
+        } => {
+            let prices: Value =
+                serde_json::from_str(&json_text).context("prices must be a JSON array")?;
+            c.post("/admin/api/settings/prices", json!({ "prices": prices }))
+                .await?
         }
         AdminCommand::Settings { patch: None } => c.get("/admin/api/runtime").await?,
         AdminCommand::Settings { patch: Some(p) } => {
