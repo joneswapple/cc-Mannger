@@ -1,6 +1,12 @@
 //! The HTTP server: the Anthropic-compatible proxy under `/v1`, invite
 //! registration, and the admin JSON API under `/admin/api`.
 
+// Handlers here return `Result<Response, Response>`, axum's usual shape:
+// the error is an HTTP response handed straight back to axum, never
+// propagated further, and `Box<Response>` isn't `IntoResponse`, so the
+// size of the `Err` variant (newer clippy's `result_large_err`) is moot.
+#![allow(clippy::result_large_err)]
+
 mod admin;
 mod insights;
 mod ops;
