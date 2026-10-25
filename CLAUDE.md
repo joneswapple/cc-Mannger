@@ -10,7 +10,8 @@ forwards Anthropic Messages API requests from per-terminal `sk-cp-…` keys it
 issues itself. It is a Tauri v2 desktop app plus a headless server over one
 Rust core, modelled on lbjlaq/Antigravity-Manager. Claude OAuth accounts
 only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
-(R0 scaffold and R1 Go parity are done; the Go cliproxy has been removed).
+(R0 scaffold, R1 Go parity and R2 multi-account scheduling are done; the Go
+cliproxy has been removed).
 
 ## Build / run / test
 
@@ -39,15 +40,21 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
   - `oauth.rs` — Claude Code credentials file shapes, atomic rewrite, refresh.
   - `provider.rs` — `AccountProvider` (per-account token + refresh, optional
     two-way sync with a credentials file, `needs_reauth` on invalid_grant),
-    `AccountPool` (picks the account per call), first-start import.
+    first-start import.
+  - `pool.rs` — `AccountPool`: eligibility (enabled, group, active, not
+    cooling), sticky sessions, strategies (priority / smooth weighted
+    round-robin / least-used), `cool_down` persisted in `cooldown_until`.
   - `auth/` — `sk-cp-` keys (bcrypt, 12-char prefix index, Go 8-char prefixes
     still resolve, 60 s cache keyed by sha256), invites (sha256 only),
     admin token (bcrypt in `global_settings`).
   - `policy.rs` — global denylist, allowlist, RPM bucket, daily quota.
   - `stats.rs` — `Recorder` writes on its own thread via a bounded channel
     (`flush()` for tests); rollups and the usage search.
-  - `upstream.rs` — reqwest client injecting Bearer, `anthropic-version`,
-    merged `anthropic-beta`, User-Agent; `Catalog` caches `/v1/models`.
+  - `upstream.rs` — `Upstream::forward` is the failover loop: pick, send,
+    `classify` the status (429/403 cool down, 401 forces refresh, 5xx/529
+    retry, else done), never reading bodies so SSE stays untouched. Injects
+    Bearer, `anthropic-version`, merged `anthropic-beta`, User-Agent.
+    `Catalog` caches `/v1/models`.
   - `rewrite.rs` — effort-tier expansion and Claude Code system injection
     (key order preserved via serde_json `preserve_order`).
   - `capture.rs` — usage / error extraction; `TeeStream` passes SSE bytes

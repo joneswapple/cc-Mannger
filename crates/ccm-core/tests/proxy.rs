@@ -33,6 +33,8 @@ enum Reply {
 struct Fake {
     seen: Arc<Mutex<Vec<Seen>>>,
     reply: Arc<Mutex<Reply>>,
+    /// Per-account overrides, keyed by the bearer token.
+    by_token: Arc<Mutex<std::collections::HashMap<String, Reply>>>,
 }
 
 async fn fake_handler(
@@ -43,7 +45,7 @@ async fn fake_handler(
 ) -> Response {
     f.seen.lock().unwrap().push(Seen {
         path: uri.path().to_string(),
-        headers,
+        headers: headers.clone(),
         body: body.to_vec(),
     });
     if uri.path() == "/v1/models" {
@@ -53,7 +55,20 @@ async fn fake_handler(
         )
             .into_response();
     }
-    match f.reply.lock().unwrap().clone() {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+    let reply = f
+        .by_token
+        .lock()
+        .unwrap()
+        .get(&token)
+        .cloned()
+        .unwrap_or_else(|| f.reply.lock().unwrap().clone());
+    match reply {
         Reply::Json(status, hdrs, body) => {
             let mut b = Response::builder()
                 .status(status)
@@ -89,6 +104,7 @@ async fn harness() -> Harness {
             vec![],
             r#"{"id":"msg_1","model":"claude-test","content":[],"usage":{"input_tokens":7,"output_tokens":3}}"#,
         ))),
+        by_token: Default::default(),
     };
     let upstream = Router::new()
         .fallback(fake_handler)
@@ -174,6 +190,46 @@ impl Harness {
 
     fn set_reply(&self, r: Reply) {
         *self.fake.reply.lock().unwrap() = r;
+    }
+
+    fn reply_for(&self, token: &str, r: Reply) {
+        self.fake.by_token.lock().unwrap().insert(token.into(), r);
+    }
+
+    /// Adds an upstream account authenticating with `token`.
+    fn add_account(&self, label: &str, token: &str, priority: i64, group: &str) -> i64 {
+        self.core
+            .accounts
+            .create(
+                ccm_core::accounts::Account {
+                    label: label.into(),
+                    enabled: true,
+                    priority,
+                    account_group: group.into(),
+                    ..Default::default()
+                },
+                &Credentials {
+                    access_token: token.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    }
+
+    /// Bearer tokens the upstream saw on `/v1/messages`, in order.
+    fn tokens_seen(&self) -> Vec<String> {
+        self.fake
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path == "/v1/messages")
+            .map(|s| {
+                hdr(&s.headers, "authorization")
+                    .trim_start_matches("Bearer ")
+                    .to_string()
+            })
+            .collect()
     }
 
     async fn admin(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -620,4 +676,235 @@ async fn admin_settings_stats_usage_accounts() {
         !a.to_string().contains("upstream-access"),
         "tokens must never be listed"
     );
+}
+
+const RATE_LIMITED: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"},"request_id":"req_a"}"#;
+
+#[tokio::test]
+async fn fails_over_on_429_and_cools_the_account_down() {
+    let h = harness().await;
+    let primary = h.add_account("primary", "primary-tok", 10, "");
+    h.reply_for(
+        "primary-tok",
+        Reply::Json(429, vec![("retry-after", "120")], RATE_LIMITED),
+    );
+
+    let (status, _, body) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(h.tokens_seen(), vec!["primary-tok", "upstream-access"]);
+
+    let a = h.core.accounts.get(primary).unwrap();
+    let left = a.cooldown_left(ccm_core_now());
+    assert!((110..=120).contains(&left), "cooldown left {left}");
+
+    // While cooling, the primary is skipped without being called.
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(h.tokens_seen().len(), 3);
+    assert_eq!(h.tokens_seen()[2], "upstream-access");
+
+    h.core.recorder.flush();
+    let (rows, _) = h
+        .core
+        .recorder
+        .search(&SearchFilter {
+            status: "429".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].account_id, Some(primary));
+    assert!(
+        rows[0].error.starts_with("failover: upstream 429"),
+        "{}",
+        rows[0].error
+    );
+}
+
+#[tokio::test]
+async fn all_accounts_limited_forwards_last_error_then_short_circuits() {
+    let h = harness().await;
+    h.add_account("second", "second-tok", 10, "");
+    h.set_reply(Reply::Json(429, vec![("retry-after", "90")], RATE_LIMITED));
+
+    let (status, headers, body) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 429);
+    assert_eq!(
+        body,
+        RATE_LIMITED.as_bytes(),
+        "the upstream's own error is forwarded"
+    );
+    assert_eq!(hdr(&headers, "retry-after"), "90");
+    assert_eq!(h.tokens_seen().len(), 2);
+
+    // Both accounts are now parked: answered locally, upstream not called.
+    let (status, headers, body) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 429);
+    assert_eq!(json(&body)["error"]["type"], "rate_limit_error");
+    let retry: i64 = hdr(&headers, "retry-after").parse().unwrap();
+    assert!((80..=90).contains(&retry), "{retry}");
+    assert_eq!(h.tokens_seen().len(), 2);
+}
+
+#[tokio::test]
+async fn server_errors_fail_over_without_cooldown() {
+    let h = harness().await;
+    let primary = h.add_account("primary", "primary-tok", 10, "");
+    h.reply_for(
+        "primary-tok",
+        Reply::Json(
+            529,
+            vec![],
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        ),
+    );
+    let (status, _, _) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.core.accounts.get(primary).unwrap().cooldown_until, 0);
+}
+
+#[tokio::test]
+async fn request_errors_are_not_retried() {
+    let h = harness().await;
+    h.add_account("primary", "primary-tok", 10, "");
+    let bad = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: required"}}"#;
+    h.reply_for("primary-tok", Reply::Json(400, vec![], bad));
+    let (status, _, body) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 400);
+    assert_eq!(body, bad.as_bytes());
+    assert_eq!(h.tokens_seen(), vec!["primary-tok"]);
+}
+
+#[tokio::test]
+async fn unauthorized_account_without_refresh_token_needs_reauth() {
+    let h = harness().await;
+    let primary = h.add_account("primary", "primary-tok", 10, "");
+    h.reply_for(
+        "primary-tok",
+        Reply::Json(
+            401,
+            vec![],
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid"}}"#,
+        ),
+    );
+    let (status, _, _) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.core.accounts.get(primary).unwrap().status, "needs_reauth");
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(
+        h.tokens_seen(),
+        vec!["primary-tok", "upstream-access", "upstream-access"]
+    );
+}
+
+#[tokio::test]
+async fn sse_after_failover_streams_from_the_next_account() {
+    let h = harness().await;
+    h.add_account("primary", "primary-tok", 10, "");
+    h.reply_for("primary-tok", Reply::Json(429, vec![], RATE_LIMITED));
+    let sse = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
+    h.set_reply(Reply::Sse(sse));
+    let (status, headers, body) = h
+        .messages(r#"{"model":"claude-test","stream":true}"#, &[])
+        .await;
+    assert_eq!(status, 200);
+    assert!(hdr(&headers, "content-type").starts_with("text/event-stream"));
+    assert_eq!(body, sse.as_bytes());
+}
+
+#[tokio::test]
+async fn sticky_sessions_and_account_groups() {
+    let h = harness().await;
+    let team = h.add_account("team", "team-tok", 0, "team");
+    h.add_account("top", "top-tok", 10, "");
+
+    // Unrestricted users get the highest-priority healthy account.
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(h.tokens_seen().last().unwrap(), "top-tok");
+
+    // A user bound to the "team" group only ever uses team accounts.
+    h.core
+        .policy
+        .set_policy(
+            h.user_id,
+            &ccm_core::policy::Policy {
+                account_group: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    h.messages(
+        r#"{"model":"claude-test","metadata":{"user_id":"sess-1"},"messages":[]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(h.tokens_seen().last().unwrap(), "team-tok");
+
+    // With the group's only account cooling, the user is told to wait
+    // rather than spilling onto other groups' accounts.
+    h.core.pool.cool_down(team, 60, "test");
+    let (status, _, _) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 429);
+}
+
+#[tokio::test]
+async fn admin_can_update_accounts() {
+    let h = harness().await;
+    let id = h.add_account("x", "x-tok", 0, "");
+    h.core.pool.cool_down(id, 600, "test");
+    let (status, a) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/accounts/{id}"),
+            Some(json!({"priority": 7, "weight": 3, "account_group": "g", "clear_cooldown": true})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        (
+            a["priority"].as_i64(),
+            a["weight"].as_i64(),
+            a["cooldown_until"].as_i64()
+        ),
+        (Some(7), Some(3), Some(0))
+    );
+    assert_eq!(a["account_group"], "g");
+    assert_eq!(
+        a["status_reason"], "",
+        "clearing a cooldown clears its reason"
+    );
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/9999",
+            Some(json!({"priority": 1})),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (_, list) = h.admin("GET", "/admin/api/accounts", None).await;
+    assert_eq!(list["pool"]["strategy"], "priority");
+    assert!(list["now"].as_i64().unwrap() > 0);
+}
+
+fn ccm_core_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }

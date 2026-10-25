@@ -32,8 +32,32 @@ pub struct Account {
     pub proxy_url: String,
     pub source_path: String,
     pub sync_file: bool,
+    /// Unix seconds until which the scheduler skips this account (0 = none).
+    pub cooldown_until: i64,
+    pub account_group: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl Account {
+    /// Seconds of cooldown left at `now` (unix seconds).
+    pub fn cooldown_left(&self, now: i64) -> i64 {
+        (self.cooldown_until - now).max(0)
+    }
+}
+
+/// Fields an admin may change on an existing account; `None` keeps the
+/// current value.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccountPatch {
+    pub label: Option<String>,
+    pub priority: Option<i64>,
+    pub weight: Option<i64>,
+    pub enabled: Option<bool>,
+    pub account_group: Option<String>,
+    /// `true` lifts an active cooldown.
+    #[serde(default)]
+    pub clear_cooldown: bool,
 }
 
 /// One OAuth token set. Field names match the Claude Code CLI credentials
@@ -58,7 +82,7 @@ pub struct AccountStore {
 }
 
 const COLS: &str = "id, label, email, org_uuid, plan, priority, weight, enabled, status, \
-    status_reason, proxy_url, source_path, sync_file, created_at, updated_at";
+    status_reason, proxy_url, source_path, sync_file, cooldown_until, account_group, created_at, updated_at";
 
 fn from_row(r: &Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
@@ -75,8 +99,10 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Account> {
         proxy_url: r.get(10)?,
         source_path: r.get(11)?,
         sync_file: r.get(12)?,
-        created_at: r.get(13)?,
-        updated_at: r.get(14)?,
+        cooldown_until: r.get(13)?,
+        account_group: r.get(14)?,
+        created_at: r.get(15)?,
+        updated_at: r.get(16)?,
     })
 }
 
@@ -111,8 +137,8 @@ impl AccountStore {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO accounts(label, email, org_uuid, plan, priority, weight, enabled, status,
-                status_reason, proxy_url, source_path, sync_file, created_at, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
+                status_reason, proxy_url, source_path, sync_file, account_group, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
             params![
                 a.label,
                 a.email,
@@ -126,6 +152,7 @@ impl AccountStore {
                 a.proxy_url,
                 a.source_path,
                 a.sync_file,
+                a.account_group,
                 now
             ],
         )?;
@@ -176,6 +203,72 @@ impl AccountStore {
             "UPDATE accounts SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
             params![enabled, crate::now_unix(), id],
         )
+    }
+
+    /// Parks an account until `until` (unix seconds) with a reason shown to
+    /// admins.
+    pub fn set_cooldown(&self, id: i64, until: i64, reason: &str) -> Result<()> {
+        self.exec(
+            "UPDATE accounts SET cooldown_until = ?1, status_reason = ?2, updated_at = ?3 WHERE id = ?4",
+            params![until, reason, crate::now_unix(), id],
+        )
+    }
+
+    pub fn update(&self, id: i64, p: &AccountPatch) -> Result<Account> {
+        let mut a = self.get(id)?;
+        if let Some(label) = &p.label {
+            if label.trim().is_empty() {
+                bail!("account label is required");
+            }
+            a.label = label.trim().to_string();
+        }
+        if let Some(v) = p.priority {
+            a.priority = v;
+        }
+        if let Some(v) = p.weight {
+            a.weight = v.max(1);
+        }
+        if let Some(v) = p.enabled {
+            a.enabled = v;
+        }
+        if let Some(g) = &p.account_group {
+            a.account_group = g.trim().to_string();
+        }
+        if p.clear_cooldown {
+            a.cooldown_until = 0;
+            // The reason belonged to the cooldown; a needs_reauth reason stays.
+            if a.status == STATUS_ACTIVE {
+                a.status_reason.clear();
+            }
+        }
+        self.exec(
+            "UPDATE accounts SET label = ?1, priority = ?2, weight = ?3, enabled = ?4,
+                account_group = ?5, cooldown_until = ?6, status_reason = ?7, updated_at = ?8
+             WHERE id = ?9",
+            params![
+                a.label,
+                a.priority,
+                a.weight,
+                a.enabled,
+                a.account_group,
+                a.cooldown_until,
+                a.status_reason,
+                crate::now_unix(),
+                id
+            ],
+        )?;
+        self.get(id)
+    }
+
+    /// Input + output tokens per account since `since` (unix seconds).
+    pub fn recent_tokens(&self, since: i64) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT account_id, COALESCE(SUM(input_tokens + output_tokens), 0)
+             FROM usage_events WHERE ts >= ?1 AND account_id IS NOT NULL GROUP BY account_id",
+        )?;
+        let rows = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn delete(&self, id: i64) -> Result<()> {
@@ -255,6 +348,13 @@ impl AccountStore {
             params![id, access, refresh, c.expires_at, c.scopes.join(" "), crate::now_unix()],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl AccountStore {
+    pub(crate) fn store_for_tests(&self) -> &Store {
+        &self.store
     }
 }
 

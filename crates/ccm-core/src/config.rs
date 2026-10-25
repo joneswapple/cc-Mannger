@@ -17,7 +17,61 @@ pub struct Config {
     /// (or create) `data_dir/secret.key`.
     pub secret_key: String,
     pub upstream: UpstreamConfig,
+    pub pool: PoolConfig,
     pub admin: AdminConfig,
+}
+
+/// How requests are spread over upstream accounts and retried.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoolConfig {
+    /// `priority` (highest priority first), `round_robin` (weighted by
+    /// `weight`), or `least_used` (fewest tokens in the last 5 hours).
+    pub strategy: Strategy,
+    /// Keep a session (`metadata.user_id`, else the terminal key) on the
+    /// same account while it stays healthy, so prompt caches keep hitting.
+    pub sticky: bool,
+    /// Forget an idle sticky binding after this many seconds.
+    pub sticky_ttl_secs: u64,
+    /// Extra accounts to try after a retryable upstream failure.
+    pub max_retries: u32,
+    /// Cooldown after a 429 when the upstream gives no reset time.
+    pub cooldown_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    #[default]
+    Priority,
+    RoundRobin,
+    LeastUsed,
+}
+
+impl std::str::FromStr for Strategy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "priority" => Ok(Self::Priority),
+            "round_robin" => Ok(Self::RoundRobin),
+            "least_used" => Ok(Self::LeastUsed),
+            _ => Err(format!(
+                "unknown pool strategy {s:?} (priority | round_robin | least_used)"
+            )),
+        }
+    }
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            strategy: Strategy::Priority,
+            sticky: true,
+            sticky_ttl_secs: 3600,
+            max_retries: 2,
+            cooldown_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +146,7 @@ impl Default for Config {
             log_level: "info".into(),
             secret_key: String::new(),
             upstream: UpstreamConfig::default(),
+            pool: PoolConfig::default(),
             admin: AdminConfig::default(),
         }
     }
@@ -151,6 +206,18 @@ impl Config {
         set(&mut self.upstream.base_url, "CCM_UPSTREAM_BASE_URL");
         set(&mut self.upstream.credentials_path, "CCM_CREDENTIALS_PATH");
         set(&mut self.admin.initial_token, "CCM_ADMIN_TOKEN");
+        if let Some(v) = get("CCM_POOL_STRATEGY").filter(|v| !v.is_empty()) {
+            match v.parse() {
+                Ok(s) => self.pool.strategy = s,
+                Err(e) => tracing::warn!("CCM_POOL_STRATEGY ignored: {e}"),
+            }
+        }
+        if let Some(v) = get("CCM_POOL_STICKY").filter(|v| !v.is_empty()) {
+            self.pool.sticky = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Some(v) = get("CCM_POOL_MAX_RETRIES").and_then(|v| v.parse().ok()) {
+            self.pool.max_retries = v;
+        }
         if let Some(v) = get("CCM_DATA_DIR").filter(|v| !v.is_empty()) {
             self.data_dir = PathBuf::from(v);
         }
@@ -193,9 +260,11 @@ mod tests {
         cfg.apply_env(|k| match k {
             "CCM_LISTEN" => Some("127.0.0.1:2".into()),
             "CCM_SYNC_CREDENTIALS_FILE" => Some("false".into()),
+            "CCM_POOL_STRATEGY" => Some("least_used".into()),
             _ => None,
         });
         assert_eq!(cfg.listen, "127.0.0.1:2");
         assert!(!cfg.upstream.sync_credentials_file);
+        assert_eq!(cfg.pool.strategy, Strategy::LeastUsed);
     }
 }

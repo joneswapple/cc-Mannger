@@ -21,6 +21,13 @@
       "max": { "max_tokens": 64000, "thinking_budget": 60000 }
     }
   },
+  "pool": {
+    "strategy": "priority",
+    "sticky": true,
+    "sticky_ttl_secs": 3600,
+    "max_retries": 2,
+    "cooldown_secs": 60
+  },
   "admin": {
     "initial_token": ""
   }

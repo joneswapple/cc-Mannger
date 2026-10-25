@@ -15,6 +15,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "002_key_prefix_index",
         include_str!("../migrations/002_key_prefix_index.sql"),
     ),
+    ("003_pool", include_str!("../migrations/003_pool.sql")),
 ];
 
 pub const DB_FILE: &str = "cc-manager.db";

@@ -1,8 +1,6 @@
 //! Turning stored accounts into bearer tokens for upstream calls.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
@@ -12,10 +10,6 @@ use crate::oauth::{self, OAuthClient};
 
 /// Refresh this long before the stamped expiry.
 const REFRESH_SKEW_MS: i64 = 60_000;
-
-#[derive(Debug, thiserror::Error)]
-#[error("no enabled upstream account — import one, or log in with `claude /login` on the host and restart")]
-pub struct NoAccount;
 
 /// Bearer tokens for one account. Refreshes on demand and writes the new
 /// token set back (encrypted) to the database. With `sync_file` set, the
@@ -27,7 +21,7 @@ pub struct AccountProvider {
     oauth: OAuthClient,
     id: i64,
     label: String,
-    sync_path: Option<PathBuf>,
+    pub(crate) sync_path: Option<PathBuf>,
     state: AsyncMutex<State>,
 }
 
@@ -103,6 +97,26 @@ impl AccountProvider {
             Err(e) => {
                 st.creds = Some(cur);
                 Err(e.context(format!("oauth refresh (account #{})", self.id)))
+            }
+        }
+    }
+
+    /// Called after the upstream rejected the access token (401): forces a
+    /// refresh on next use, or marks the account `needs_reauth` when there
+    /// is nothing to refresh with.
+    pub async fn invalidate(&self) {
+        let mut st = self.state.lock().await;
+        let can_refresh = match st.creds.as_mut() {
+            Some(c) => {
+                c.expires_at = 1;
+                !c.refresh_token.is_empty()
+            }
+            None => true,
+        };
+        if !can_refresh && self.sync_path.is_none() {
+            let reason = "upstream rejected the access token (401) and there is no refresh token";
+            if let Err(e) = self.store.set_status(self.id, STATUS_NEEDS_REAUTH, reason) {
+                tracing::warn!(account = self.id, "mark needs_reauth: {e:#}");
             }
         }
     }
@@ -183,69 +197,6 @@ fn near_expiry(c: &Credentials) -> bool {
     c.expires_at > 0 && crate::now_millis() > c.expires_at - REFRESH_SKEW_MS
 }
 
-/// Picks the account for each upstream call. R0 strategy: the first enabled
-/// account in priority order whose status is active, falling back to the
-/// first enabled account at all so a needs_reauth account still surfaces its
-/// real upstream error instead of a generic "no account".
-#[derive(Clone)]
-pub struct AccountPool {
-    store: AccountStore,
-    oauth: OAuthClient,
-    providers: Arc<Mutex<HashMap<i64, Arc<AccountProvider>>>>,
-}
-
-impl AccountPool {
-    pub fn new(store: AccountStore, oauth: OAuthClient) -> Self {
-        Self {
-            store,
-            oauth,
-            providers: Default::default(),
-        }
-    }
-
-    pub fn pick(&self) -> Result<Arc<AccountProvider>> {
-        let a = self.choose()?;
-        Ok(self.provider(&a))
-    }
-
-    fn choose(&self) -> Result<Account> {
-        let list = self.store.list()?;
-        let mut enabled = list.into_iter().filter(|a| a.enabled).peekable();
-        let first = enabled.peek().cloned();
-        enabled
-            .find(|a| a.status == STATUS_ACTIVE)
-            .or(first)
-            .ok_or_else(|| NoAccount.into())
-    }
-
-    /// Cached per account so the in-memory token survives across requests;
-    /// rebuilt when the account's sync settings change.
-    fn provider(&self, a: &Account) -> Arc<AccountProvider> {
-        let mut map = self.providers.lock().unwrap_or_else(|e| e.into_inner());
-        let want: Option<PathBuf> =
-            (a.sync_file && !a.source_path.is_empty()).then(|| a.source_path.clone().into());
-        if let Some(p) = map.get(&a.id) {
-            if p.sync_path == want {
-                return p.clone();
-            }
-        }
-        let p = Arc::new(AccountProvider::new(
-            self.store.clone(),
-            self.oauth.clone(),
-            a,
-        ));
-        map.insert(a.id, p.clone());
-        p
-    }
-
-    pub fn source(&self) -> String {
-        match self.pick() {
-            Ok(p) => p.source(),
-            Err(e) => format!("account pool: {e}"),
-        }
-    }
-}
-
 /// Seeds an empty accounts table from the host's Claude Code credentials
 /// file. Returns the new account id, or `None` when accounts already exist.
 pub fn import_cli_credentials(
@@ -282,6 +233,7 @@ mod tests {
     use crate::accounts::test_store;
     use axum::{routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// A fake OAuth token endpoint accepting only `good_refresh`.
     async fn token_server(good_refresh: &'static str) -> (String, Arc<AtomicUsize>) {
@@ -334,42 +286,6 @@ mod tests {
         assert_eq!(import_cli_credentials(&s, &path, true).unwrap(), None);
         assert_eq!(s.load_credentials(id).unwrap().access_token, "a");
         assert!(s.get(id).unwrap().sync_file);
-    }
-
-    #[test]
-    fn pool_prefers_priority_and_skips_disabled() {
-        let s = test_store();
-        let c = creds("a", "", 0);
-        let low = s
-            .create(
-                Account {
-                    label: "low".into(),
-                    enabled: true,
-                    ..Default::default()
-                },
-                &c,
-            )
-            .unwrap();
-        let high = s
-            .create(
-                Account {
-                    label: "high".into(),
-                    enabled: true,
-                    priority: 9,
-                    ..Default::default()
-                },
-                &c,
-            )
-            .unwrap();
-        let pool = AccountPool::new(s.clone(), OAuthClient::new("http://unused", "cli"));
-        assert_eq!(pool.pick().unwrap().account_id(), high);
-        s.set_status(high, STATUS_NEEDS_REAUTH, "x").unwrap();
-        assert_eq!(pool.pick().unwrap().account_id(), low);
-        s.set_enabled(low, false).unwrap();
-        // Only a needs_reauth account left: still picked so its error surfaces.
-        assert_eq!(pool.pick().unwrap().account_id(), high);
-        s.set_enabled(high, false).unwrap();
-        assert!(pool.pick().err().unwrap().is::<NoAccount>());
     }
 
     #[tokio::test]

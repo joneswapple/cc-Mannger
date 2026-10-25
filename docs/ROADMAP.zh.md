@@ -27,7 +27,7 @@ index.html, package.json   # Vite 入口
 scripts/                   # install.sh / install.ps1 等
 ```
 
-**进度**：R0、R1 已完成，Go 版 cliproxy 已删除（旧数据用 `ccm-server migrate-from-go` 迁移）。
+**进度**：R0、R1、R2 已完成，Go 版 cliproxy 已删除（旧数据用 `ccm-server migrate-from-go` 迁移）。
 
 ## 2. 功能对照
 
@@ -78,11 +78,13 @@ scripts/                   # install.sh / install.ps1 等
 - 从 Go 版数据库迁移（用户、Key、策略、统计、账号）。
 - 把 Go 版的测试用例逐条移植；全部通过后删除 `cmd/`、`internal/`、`go.mod`，更新 README / CLAUDE.md。
 
-### R2：账号池调度与故障切换
+### R2：账号池调度与故障切换（已完成）
 
 - 调度策略：`priority` / `round_robin` / `least_used`，叠加 `sticky`（按终端 Key / `metadata.user_id` 绑定账号，保住 prompt cache）。
 - 在尚未向客户端写出字节前，遇到 429 / 401 / 403 / 529 / 网络错误就换账号重试；冷却时长取自 `retry-after` / 限额重置头。
 - 统计增加"按账号"维度；终端可绑定账号组。
+- 实现说明：403 没有直接禁用账号，而是冷却 30 分钟（避免一次误判就要手动恢复）；
+  所有可用账号都在冷却时本地直接返回 429 + `retry-after`；冷却存在 `accounts.cooldown_until`，重启不丢。
 
 ### R3：账号管理界面（登录 / 导入 / 切换）
 

@@ -8,6 +8,7 @@ pub mod config;
 pub mod http;
 pub mod oauth;
 pub mod policy;
+pub mod pool;
 pub mod provider;
 pub mod rewrite;
 pub mod secret;
@@ -24,7 +25,7 @@ use crate::auth::{Admin, Invites, Keys};
 use crate::config::Config;
 use crate::oauth::OAuthClient;
 use crate::policy::Engine;
-use crate::provider::AccountPool;
+use crate::pool::AccountPool;
 use crate::secret::SecretBox;
 use crate::stats::Recorder;
 use crate::store::Store;
@@ -78,7 +79,7 @@ impl Core {
             &config.upstream.oauth_token_url,
             &config.upstream.oauth_client_id,
         );
-        let pool = AccountPool::new(accounts.clone(), oauth);
+        let pool = AccountPool::new(accounts.clone(), oauth, config.pool.clone());
         let upstream = Upstream::new(&config.upstream, pool.clone());
         Ok((
             Core {

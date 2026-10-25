@@ -15,15 +15,83 @@ use super::{anthropic_error, header, ApiIdentity};
 use crate::auth::Identity;
 use crate::capture::{Captured, TeeStream};
 use crate::policy::Denied;
+use crate::pool::{AllCooling, NoAccount, PickRequest};
 use crate::rewrite;
 use crate::stats::Event;
-use crate::upstream::{passthrough_user_agent, ForwardExtra, UpstreamError};
+use crate::upstream::{passthrough_user_agent, Attempt, ForwardError, ForwardExtra, Forwarded};
 use crate::Core;
 
 #[derive(Deserialize)]
 struct MessageRequest {
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    metadata: Option<Metadata>,
+}
+
+#[derive(Deserialize)]
+struct Metadata {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+/// Session identity for sticky routing: Claude Code puts a per-session id
+/// in `metadata.user_id`; other clients fall back to their terminal key.
+fn sticky_key(req: &MessageRequest, id: &Identity) -> String {
+    match req.metadata.as_ref().and_then(|m| m.user_id.as_deref()) {
+        Some(u) if !u.is_empty() => format!("session:{u}"),
+        _ => format!("key:{}", id.key_id),
+    }
+}
+
+/// Client-facing response when no upstream answer can be forwarded.
+fn forward_error(e: &ForwardError) -> Response {
+    match e {
+        ForwardError::Pick(err) => {
+            if let Some(c) = err.downcast_ref::<AllCooling>() {
+                let mut resp = anthropic_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    c.to_string(),
+                );
+                if let Ok(v) = c.retry_after.to_string().parse() {
+                    resp.headers_mut().insert("retry-after", v);
+                }
+                resp
+            } else if err.is::<NoAccount>() {
+                anthropic_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    format!("upstream: {err}"),
+                )
+            } else {
+                anthropic_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    format!("{err:#}"),
+                )
+            }
+        }
+        ForwardError::Exhausted { last, .. } => anthropic_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            format!("upstream: {}", last.error),
+        ),
+        ForwardError::Response(_) => internal("unforwarded upstream response"),
+    }
+}
+
+/// The failed attempts behind a forward outcome, for stats.
+fn failed_attempts(r: &Result<Forwarded, ForwardError>) -> Vec<Attempt> {
+    match r {
+        Ok(f) => f.failed.clone(),
+        Err(ForwardError::Exhausted { last, failed }) => failed
+            .iter()
+            .chain(std::iter::once(last))
+            .cloned()
+            .collect(),
+        Err(_) => vec![],
+    }
 }
 
 fn forward_extra(headers: &HeaderMap) -> ForwardExtra {
@@ -91,6 +159,7 @@ pub(super) async fn messages(
             "model is required",
         );
     }
+    let sticky = sticky_key(&parsed, &id);
     let model = parsed.model;
 
     // Effort tiers first, so later steps see a canonical body.
@@ -106,8 +175,8 @@ pub(super) async fn messages(
         }
     };
 
-    match core.policy.check(id.user_id, &model) {
-        Ok(Ok(())) => {}
+    let policy = match core.policy.check(id.user_id, &model) {
+        Ok(Ok(p)) => p,
         Ok(Err(denied)) => {
             let (status, kind) = match denied {
                 Denied::RateLimited | Denied::QuotaExceeded => {
@@ -126,7 +195,7 @@ pub(super) async fn messages(
                 format!("policy: {e:#}"),
             )
         }
-    }
+    };
 
     let body = maybe_inject(&core, body);
     let start = Instant::now();
@@ -145,32 +214,39 @@ pub(super) async fn messages(
         error,
     };
 
-    let resp = match core
+    let pick = PickRequest {
+        sticky_key: Some(sticky),
+        group: policy.account_group,
+        exclude: vec![],
+    };
+    let result = core
         .upstream
-        .send(
+        .forward(
+            &pick,
             Method::POST,
             "/v1/messages",
             Some(body),
             &forward_extra(&headers),
         )
         .await
-    {
-        Ok((resp, account)) => (resp, account),
-        Err(e) => {
-            let account = e
-                .downcast_ref::<UpstreamError>()
-                .map_or(0, |u| u.account_id);
-            let msg = format!("{e:#}");
-            core.recorder
-                .record(event(account, 502, &Captured::default(), msg.clone()));
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                format!("upstream: {msg}"),
-            );
-        }
+        .or_else(ForwardError::into_forwarded);
+    for a in failed_attempts(&result) {
+        core.recorder.record(Event {
+            latency_ms: a.latency_ms,
+            ..event(
+                a.account_id,
+                a.status,
+                &Captured::default(),
+                format!("failover: {}", a.error),
+            )
+        });
+    }
+    let Forwarded {
+        resp, account_id, ..
+    } = match result {
+        Ok(f) => f,
+        Err(e) => return forward_error(&e),
     };
-    let (resp, account_id) = resp;
     let status = resp.status().as_u16();
     let head = response_head(&resp);
     let is_sse = resp
@@ -250,29 +326,34 @@ fn internal(e: impl std::fmt::Display) -> Response {
 /// gate or stats: counting tokens isn't billable inference.
 pub(super) async fn count_tokens(
     State(core): State<Core>,
-    ApiIdentity(_): ApiIdentity,
+    ApiIdentity(id): ApiIdentity,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let body = maybe_inject(&core, body);
+    let group = match core.policy.get_policy(id.user_id) {
+        Ok(p) => p.account_group,
+        Err(e) => return internal(format!("policy: {e:#}")),
+    };
+    let pick = PickRequest {
+        sticky_key: Some(format!("key:{}", id.key_id)),
+        group,
+        exclude: vec![],
+    };
     let resp = match core
         .upstream
-        .send(
+        .forward(
+            &pick,
             Method::POST,
             "/v1/messages/count_tokens",
             Some(body),
             &forward_extra(&headers),
         )
         .await
+        .or_else(ForwardError::into_forwarded)
     {
-        Ok((resp, _)) => resp,
-        Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                format!("upstream: {e:#}"),
-            )
-        }
+        Ok(f) => f.resp,
+        Err(e) => return forward_error(&e),
     };
     let head = response_head(&resp);
     match resp.bytes().await {

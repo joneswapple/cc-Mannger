@@ -14,6 +14,9 @@ use crate::store::Store;
 
 const SETTING_DISABLED_MODELS: &str = "disabled_models";
 
+/// allowed_models, daily_token_limit, rpm_limit, account_group
+type PolicyRow = (Option<String>, Option<i64>, Option<i64>, Option<String>);
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Denied {
     #[error("model disabled by global policy")]
@@ -32,6 +35,9 @@ pub struct Policy {
     pub allowed_models: Option<Vec<String>>,
     pub daily_token_limit: Option<i64>,
     pub rpm_limit: Option<i64>,
+    /// Restricts the user to upstream accounts in this group.
+    #[serde(default)]
+    pub account_group: Option<String>,
 }
 
 #[derive(Clone)]
@@ -49,16 +55,17 @@ impl Engine {
     }
 
     pub fn get_policy(&self, user_id: i64) -> Result<Policy> {
-        let row: Option<(Option<String>, Option<i64>, Option<i64>)> = self
+        let row: Option<PolicyRow> = self
             .store
             .conn()
             .query_row(
-                "SELECT allowed_models, daily_token_limit, rpm_limit FROM policies WHERE user_id = ?1",
+                "SELECT allowed_models, daily_token_limit, rpm_limit, account_group
+                 FROM policies WHERE user_id = ?1",
                 [user_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((allowed, daily, rpm)) = row else {
+        let Some((allowed, daily, rpm, group)) = row else {
             return Ok(Policy::default());
         };
         Ok(Policy {
@@ -68,6 +75,7 @@ impl Engine {
             },
             daily_token_limit: daily,
             rpm_limit: rpm,
+            account_group: group.filter(|g| !g.is_empty()),
         })
     }
 
@@ -78,13 +86,20 @@ impl Engine {
             .map(serde_json::to_string)
             .transpose()?;
         self.store.conn().execute(
-            "INSERT INTO policies(user_id, allowed_models, daily_token_limit, rpm_limit)
-             VALUES(?1, ?2, ?3, ?4)
+            "INSERT INTO policies(user_id, allowed_models, daily_token_limit, rpm_limit, account_group)
+             VALUES(?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(user_id) DO UPDATE SET
                 allowed_models = excluded.allowed_models,
                 daily_token_limit = excluded.daily_token_limit,
-                rpm_limit = excluded.rpm_limit",
-            params![user_id, allowed, p.daily_token_limit, p.rpm_limit],
+                rpm_limit = excluded.rpm_limit,
+                account_group = excluded.account_group",
+            params![
+                user_id,
+                allowed,
+                p.daily_token_limit,
+                p.rpm_limit,
+                p.account_group.as_deref().map(str::trim).filter(|g| !g.is_empty())
+            ],
         )?;
         Ok(())
     }
@@ -101,9 +116,10 @@ impl Engine {
             .set_setting(SETTING_DISABLED_MODELS, &serde_json::to_string(models)?)
     }
 
-    /// Evaluates every gate for one request. `Ok(Err(_))` is a policy denial;
-    /// the outer error is a storage failure.
-    pub fn check(&self, user_id: i64, model: &str) -> Result<Result<(), Denied>> {
+    /// Evaluates every gate for one request and returns the user's policy
+    /// when allowed. `Ok(Err(_))` is a policy denial; the outer error is a
+    /// storage failure.
+    pub fn check(&self, user_id: i64, model: &str) -> Result<Result<Policy, Denied>> {
         if self
             .disabled_models()?
             .iter()
@@ -127,7 +143,7 @@ impl Engine {
                 return Ok(Err(Denied::QuotaExceeded));
             }
         }
-        Ok(Ok(()))
+        Ok(Ok(p))
     }
 
     /// Fixed one-minute window per user.
@@ -187,10 +203,13 @@ mod tests {
         e.set_policy(uid, &p).unwrap();
         assert_eq!(e.get_policy(uid).unwrap(), p);
         assert_eq!(
-            e.check(uid, "claude-opus-4-1").unwrap(),
+            e.check(uid, "claude-opus-4-1").unwrap().map(|_| ()),
             Err(Denied::ModelNotAllowed)
         );
-        assert_eq!(e.check(uid, "claude-sonnet-4-5").unwrap(), Ok(()));
+        assert_eq!(
+            e.check(uid, "claude-sonnet-4-5").unwrap().map(|_| ()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -198,10 +217,10 @@ mod tests {
         let (e, _, uid) = setup();
         e.set_disabled_models(&["claude-opus-4-1".into()]).unwrap();
         assert_eq!(
-            e.check(uid, "CLAUDE-OPUS-4-1").unwrap(),
+            e.check(uid, "CLAUDE-OPUS-4-1").unwrap().map(|_| ()),
             Err(Denied::ModelDisabled)
         );
-        assert_eq!(e.check(uid, "claude-haiku").unwrap(), Ok(()));
+        assert_eq!(e.check(uid, "claude-haiku").unwrap().map(|_| ()), Ok(()));
     }
 
     #[test]
@@ -215,9 +234,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(e.check(uid, "m").unwrap(), Ok(()));
-        assert_eq!(e.check(uid, "m").unwrap(), Ok(()));
-        assert_eq!(e.check(uid, "m").unwrap(), Err(Denied::RateLimited));
+        assert_eq!(e.check(uid, "m").unwrap().map(|_| ()), Ok(()));
+        assert_eq!(e.check(uid, "m").unwrap().map(|_| ()), Ok(()));
+        assert_eq!(
+            e.check(uid, "m").unwrap().map(|_| ()),
+            Err(Denied::RateLimited)
+        );
     }
 
     #[test]
@@ -231,7 +253,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(e.check(uid, "m").unwrap(), Ok(()));
+        assert_eq!(e.check(uid, "m").unwrap().map(|_| ()), Ok(()));
         store
             .conn()
             .execute(
@@ -240,6 +262,9 @@ mod tests {
                 params![crate::now_unix(), uid],
             )
             .unwrap();
-        assert_eq!(e.check(uid, "m").unwrap(), Err(Denied::QuotaExceeded));
+        assert_eq!(
+            e.check(uid, "m").unwrap().map(|_| ()),
+            Err(Denied::QuotaExceeded)
+        );
     }
 }

@@ -27,6 +27,9 @@ for Claude only.
   daily / per-user / per-model / per-account rollups.
 - Upstream accounts stored in SQLite with AES-256-GCM encrypted tokens; the
   host's Claude Code login is imported automatically on first start.
+- Multiple accounts with scheduling (priority / weighted round-robin /
+  least-used), sticky sessions that keep prompt caches warm, automatic
+  failover on 429 / 401 / 403 / 5xx with cooldowns, and account groups.
 - Two shells over one Rust core: the **desktop app** (window + tray, proxy
   runs in-process) and **`ccm-server`** (headless, for servers / Docker).
 
@@ -90,6 +93,11 @@ A full sample is [`config.example.json`](./config.example.json).
 | `upstream.user_agent`             | —                                | `claude-cli/1.0 (cc-manager)`                  |
 | `upstream.inject_claude_code_system` | —                             | `true`                                         |
 | `upstream.effort_levels`          | —                                | see "Effort tiers"                             |
+| `pool.strategy`                   | `CCM_POOL_STRATEGY`              | `priority` (`round_robin`, `least_used`)       |
+| `pool.sticky`                     | `CCM_POOL_STICKY`                | `true`                                         |
+| `pool.sticky_ttl_secs`            | —                                | `3600`                                         |
+| `pool.max_retries`                | `CCM_POOL_MAX_RETRIES`           | `2`                                            |
+| `pool.cooldown_secs`              | —                                | `60`                                           |
 | `admin.initial_token`             | `CCM_ADMIN_TOKEN`                | empty → random token printed on first start    |
 
 `ccm-server` also reads `--config` / `CCM_CONFIG` for the config path.
@@ -126,7 +134,8 @@ Timestamps in admin responses are unix seconds.
 | `POST` | `/admin/api/keys/{id}/revoke`             | admin           | Revoke a key.                                         |
 | `GET` `POST` | `/admin/api/invites`                | admin           | List / create (`{label, ttl_hours}` → `{token, expires_at}`). |
 | `POST` | `/admin/api/invites/{hash}/delete`        | admin           | Delete an unredeemed invite.                          |
-| `GET`  | `/admin/api/accounts`                     | admin           | Upstream accounts (metadata only, never tokens).      |
+| `GET`  | `/admin/api/accounts`                     | admin           | Upstream accounts (metadata only, never tokens), pool config, `now`. |
+| `POST` | `/admin/api/accounts/{id}`                | admin           | Update `{label, priority, weight, enabled, account_group, clear_cooldown}`. |
 | `GET`  | `/admin/api/settings`                     | admin           | Denylist, model catalog, upstream wire settings.      |
 | `POST` | `/admin/api/settings/disabled-models`     | admin           | Replace the global denylist (`{models: [...]}`).      |
 | `POST` | `/admin/api/settings/refresh-models`      | admin           | Refetch the model catalog now.                        |
@@ -152,6 +161,8 @@ ccm-server admin user list | create --label x | enable 3 | disable 3
 ccm-server admin user policy 3 --allow claude-sonnet-4-5 --rpm 10 --daily-tokens 2000000
 ccm-server admin key issue 3 | revoke 7
 ccm-server admin account list
+ccm-server admin account set 2 --priority 10 --weight 3 --group team --clear-cooldown
+ccm-server admin user policy 3 --group team         # bind a terminal to an account group
 ccm-server admin models list | disable claude-opus-4-1 | refresh
 ccm-server admin stats --days 7
 ccm-server admin usage --status error --page-size 20
@@ -177,6 +188,37 @@ Copies users, API keys, invites, policies, the admin token, the model
 denylist and usage history into a fresh CC Manager data dir, keeping ids —
 existing `sk-cp-…` keys and the admin token keep working. Upstream accounts
 are decrypted with the Go `secret.key` (or `--go-secret-key`) and re-sealed.
+
+## Multiple accounts
+
+Every enabled account is a candidate. For each request CC Manager:
+
+1. Keeps only accounts in the user's group (`account_group` in the user's
+   policy; unset means every account), that are `active`, and that aren't
+   cooling down.
+2. Reuses the session's sticky account if it is still healthy. The session
+   is Claude Code's `metadata.user_id`, else the terminal key. This keeps
+   Anthropic's prompt cache hitting.
+3. Otherwise applies `pool.strategy`: `priority` (highest `priority`, then
+   oldest), `round_robin` (smooth, weighted by `weight`), or `least_used`
+   (fewest tokens in the last 5 hours).
+
+Before any byte reaches the client, a failed attempt moves on to another
+account, up to `pool.max_retries` extra attempts:
+
+| Upstream result          | Action                                                         |
+| ------------------------ | -------------------------------------------------------------- |
+| 429                      | Cool the account down until `retry-after` / `anthropic-ratelimit-*-reset` (else `pool.cooldown_secs`), try the next. |
+| 401                      | Force a token refresh (or mark `needs_reauth` without a refresh token), try the next. |
+| 403                      | Cool down 30 minutes, try the next.                            |
+| 500 / 502 / 503 / 504 / 529, network error | Try the next, no cooldown.                   |
+| anything else            | Forward as is.                                                 |
+
+When the accounts run out, the last upstream response is forwarded verbatim.
+If every eligible account is already cooling, the proxy answers 429
+`rate_limit_error` with a `retry-after` for the earliest one, without calling
+upstream. Cooldowns are stored in the database and survive restarts. Each
+failed attempt is recorded in usage with a `failover: …` error.
 
 ## Operating notes
 

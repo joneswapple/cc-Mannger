@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{json_error, AdminAuth};
+use crate::accounts::{AccountPatch, NotFound};
 use crate::auth::InviteError;
 use crate::policy::Policy;
 use crate::stats::SearchFilter;
@@ -29,6 +30,7 @@ pub(super) fn routes() -> Router<Core> {
         .route("/invites", get(list_invites).post(create_invite))
         .route("/invites/:hash/delete", post(delete_invite))
         .route("/accounts", get(list_accounts))
+        .route("/accounts/:id", post(update_account))
         .route("/settings", get(settings))
         .route("/settings/disabled-models", post(set_disabled_models))
         .route("/settings/refresh-models", post(refresh_models))
@@ -213,9 +215,28 @@ async fn delete_invite(
     Ok(no_content())
 }
 
-/// Account metadata only; tokens never leave the store.
+/// Account metadata only; tokens never leave the store. `now` lets clients
+/// turn `cooldown_until` into a countdown.
 async fn list_accounts(_: AdminAuth, State(core): State<Core>) -> ApiResult {
-    Ok(Json(json!({"accounts": core.accounts.list().map_err(internal)?})).into_response())
+    Ok(Json(json!({
+        "accounts": core.accounts.list().map_err(internal)?,
+        "now": crate::now_unix(),
+        "pool": core.pool.config(),
+    }))
+    .into_response())
+}
+
+async fn update_account(
+    _: AdminAuth,
+    State(core): State<Core>,
+    Path(id): Path<i64>,
+    Json(patch): Json<AccountPatch>,
+) -> ApiResult {
+    match core.accounts.update(id, &patch) {
+        Ok(a) => Ok(Json(a).into_response()),
+        Err(e) if e.is::<NotFound>() => Err(json_error(StatusCode::NOT_FOUND, e)),
+        Err(e) => Err(json_error(StatusCode::BAD_REQUEST, format!("{e:#}"))),
+    }
 }
 
 async fn settings(_: AdminAuth, State(core): State<Core>) -> ApiResult {

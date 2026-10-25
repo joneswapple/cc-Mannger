@@ -9,7 +9,8 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use crate::config::UpstreamConfig;
-use crate::provider::AccountPool;
+use crate::pool::{AccountPool, PickRequest};
+use crate::provider::AccountProvider;
 
 /// Per-request hints from the inbound caller, layered over the configured
 /// defaults. All optional.
@@ -52,25 +53,116 @@ impl Upstream {
         self.pool.source()
     }
 
-    /// Sends a request with the picked account's bearer token. Returns the
-    /// response and the id of the account that served it.
-    pub async fn send(
+    /// Sends a request, failing over across accounts.
+    ///
+    /// Each attempt picks an account (skipping ones already tried), sends,
+    /// and classifies the status with [`classify`]. Retryable outcomes park
+    /// or refresh the account and move on, up to `pool.max_retries` extra
+    /// attempts. When attempts or accounts run out, the last upstream
+    /// response is returned verbatim so clients still see Anthropic's own
+    /// error. Bodies are never read here, so SSE streams are untouched.
+    pub async fn forward(
         &self,
+        req: &PickRequest,
         method: Method,
         path: &str,
         body: Option<Bytes>,
         extra: &ForwardExtra,
-    ) -> Result<(reqwest::Response, i64)> {
-        let provider = self.pool.pick()?;
-        let account_id = provider.account_id();
+    ) -> Result<Forwarded, ForwardError> {
+        let mut pick_req = req.clone();
+        let mut failed: Vec<Attempt> = Vec::new();
+        // Last retryable response, returned if nothing better comes along.
+        let mut pending: Option<(reqwest::Response, Attempt)> = None;
+        for _ in 0..=self.pool.config().max_retries {
+            let provider = match self.pool.pick(&pick_req) {
+                Ok(p) => p,
+                Err(e) => return Err(finish_without_pick(pending, failed, e)),
+            };
+            if let Some((_, attempt)) = pending.take() {
+                failed.push(attempt);
+            }
+            let account_id = provider.account_id();
+            pick_req.exclude.push(account_id);
+            let start = std::time::Instant::now();
+            let result = self
+                .send_once(&provider, method.clone(), path, body.clone(), extra)
+                .await;
+            let latency_ms = start.elapsed().as_millis() as i64;
+            let resp = match result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(account = account_id, "upstream attempt failed: {e:#}");
+                    failed.push(Attempt {
+                        account_id,
+                        status: 502,
+                        error: format!("{e:#}"),
+                        latency_ms,
+                    });
+                    continue;
+                }
+            };
+            let status = resp.status().as_u16();
+            let verdict = classify(
+                status,
+                resp.headers(),
+                self.pool.config().cooldown_secs as i64,
+            );
+            let error = match verdict {
+                Verdict::Done => {
+                    return Ok(Forwarded {
+                        resp,
+                        account_id,
+                        failed,
+                    })
+                }
+                Verdict::Retry {
+                    cooldown: Some(secs),
+                } => {
+                    self.pool
+                        .cool_down(account_id, secs, &format!("upstream {status}"));
+                    format!("upstream {status}; account cooling down {secs}s")
+                }
+                Verdict::Retry { cooldown: None } => format!("upstream {status}"),
+                Verdict::Reauth => {
+                    provider.invalidate().await;
+                    format!("upstream {status}; token refresh forced")
+                }
+            };
+            pending = Some((
+                resp,
+                Attempt {
+                    account_id,
+                    status,
+                    error,
+                    latency_ms,
+                },
+            ));
+        }
+        match pending {
+            Some((resp, attempt)) => Ok(Forwarded {
+                resp,
+                account_id: attempt.account_id,
+                failed,
+            }),
+            None => {
+                let last = failed.pop().expect("at least one attempt ran");
+                Err(ForwardError::Exhausted { last, failed })
+            }
+        }
+    }
+
+    async fn send_once(
+        &self,
+        provider: &AccountProvider,
+        method: Method,
+        path: &str,
+        body: Option<Bytes>,
+        extra: &ForwardExtra,
+    ) -> Result<reqwest::Response> {
         let token = provider
             .token()
             .await
-            .map_err(|e| e.context("acquire upstream token"))
-            .map_err(|e| UpstreamError {
-                account_id,
-                inner: e,
-            })?;
+            .map_err(|e| e.context("acquire upstream token"))?;
         let mut req = self
             .http
             .request(method, format!("{}{path}", self.base_url))
@@ -93,21 +185,145 @@ impl Upstream {
                 )
                 .body(body);
         }
-        let resp = req.send().await.map_err(|e| UpstreamError {
-            account_id,
-            inner: e.into(),
-        })?;
-        Ok((resp, account_id))
+        Ok(req.send().await?)
     }
 }
 
-/// An upstream failure after an account was picked, so callers can still
-/// attribute it.
-#[derive(Debug, thiserror::Error)]
-#[error("{inner:#}")]
-pub struct UpstreamError {
+/// When no account can be picked: hand back the last retryable response if
+/// there is one, else the last failed attempt, else the pick error.
+fn finish_without_pick(
+    pending: Option<(reqwest::Response, Attempt)>,
+    mut failed: Vec<Attempt>,
+    pick_err: anyhow::Error,
+) -> ForwardError {
+    if let Some((resp, attempt)) = pending {
+        return ForwardError::Response(Box::new(Forwarded {
+            resp,
+            account_id: attempt.account_id,
+            failed,
+        }));
+    }
+    match failed.pop() {
+        Some(last) => ForwardError::Exhausted { last, failed },
+        None => ForwardError::Pick(pick_err),
+    }
+}
+
+/// One upstream attempt that did not produce the final answer.
+#[derive(Debug, Clone)]
+pub struct Attempt {
     pub account_id: i64,
-    pub inner: anyhow::Error,
+    /// HTTP status, or 502 for a transport / token failure.
+    pub status: u16,
+    pub error: String,
+    pub latency_ms: i64,
+}
+
+/// The response to hand to the client, plus the attempts that failed over
+/// before it.
+pub struct Forwarded {
+    pub resp: reqwest::Response,
+    pub account_id: i64,
+    pub failed: Vec<Attempt>,
+}
+
+impl std::fmt::Debug for Forwarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Forwarded")
+            .field("status", &self.resp.status())
+            .field("account_id", &self.account_id)
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ForwardError {
+    /// No account could be picked at all (`pool::NoAccount`,
+    /// `pool::AllCooling`).
+    #[error("{0:#}")]
+    Pick(anyhow::Error),
+    /// Every attempt failed without an upstream response.
+    #[error("{}", last.error)]
+    Exhausted { last: Attempt, failed: Vec<Attempt> },
+    /// Accounts ran out after a retryable upstream response; forward it.
+    #[error("upstream {}", .0.resp.status())]
+    Response(Box<Forwarded>),
+}
+
+impl ForwardError {
+    /// The response to forward when this is [`ForwardError::Response`].
+    pub fn into_forwarded(self) -> Result<Forwarded, ForwardError> {
+        match self {
+            ForwardError::Response(f) => Ok(*f),
+            e => Err(e),
+        }
+    }
+}
+
+/// What an upstream status means for failover.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Hand this response to the client (success, or a request error that
+    /// another account wouldn't fix).
+    Done,
+    /// Try another account, optionally parking this one for `cooldown` s.
+    Retry { cooldown: Option<i64> },
+    /// The access token was rejected: force a refresh, try another account.
+    Reauth,
+}
+
+/// 429 → park until the upstream's reset time (or `default_cooldown`);
+/// 403 → park 30 minutes (account-level permission problem); 401 → refresh;
+/// 500/502/503/504/529 → just try another account; anything else is final.
+pub fn classify(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    default_cooldown: i64,
+) -> Verdict {
+    match status {
+        429 => Verdict::Retry {
+            cooldown: Some(reset_after(headers, crate::now_unix()).unwrap_or(default_cooldown)),
+        },
+        403 => Verdict::Retry {
+            cooldown: Some(30 * 60),
+        },
+        401 => Verdict::Reauth,
+        500 | 502 | 503 | 504 | 529 => Verdict::Retry { cooldown: None },
+        _ => Verdict::Done,
+    }
+}
+
+/// Seconds until the upstream says the limit resets: `retry-after`
+/// (seconds), else `anthropic-ratelimit-unified-reset`, else the earliest
+/// future `anthropic-ratelimit-*-reset` (unix seconds or RFC 3339).
+pub fn reset_after(headers: &reqwest::header::HeaderMap, now: i64) -> Option<i64> {
+    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
+    if let Some(secs) = get("retry-after").and_then(|v| v.parse::<i64>().ok()) {
+        return Some(secs.max(1));
+    }
+    let parse = |v: &str| -> Option<i64> {
+        v.parse::<i64>()
+            .ok()
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(v)
+                    .ok()
+                    .map(|t| t.timestamp())
+            })
+            .map(|t| t - now)
+            .filter(|s| *s > 0)
+    };
+    if let Some(s) = get("anthropic-ratelimit-unified-reset").and_then(parse) {
+        return Some(s);
+    }
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            let k = k.as_str();
+            k.starts_with("anthropic-ratelimit-") && k.ends_with("-reset")
+        })
+        .filter_map(|(_, v)| v.to_str().ok().and_then(|v| parse(v.trim())))
+        .min()
 }
 
 /// Combines two comma-separated `anthropic-beta` values: `primary` order
@@ -222,15 +438,18 @@ impl Catalog {
     }
 
     async fn fetch(&self) -> Result<Vec<Model>> {
-        let (resp, _) = self
+        let resp = self
             .upstream
-            .send(
+            .forward(
+                &PickRequest::default(),
                 Method::GET,
                 "/v1/models?limit=1000",
                 None,
                 &ForwardExtra::default(),
             )
-            .await?;
+            .await
+            .or_else(ForwardError::into_forwarded)?
+            .resp;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -279,6 +498,67 @@ mod tests {
         assert_eq!(merge_beta("a,b", " b , c,,a"), "a,b,c");
         assert_eq!(merge_beta("", "x"), "x");
         assert_eq!(merge_beta("", ""), "");
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn classify_statuses() {
+        let none = headers(&[]);
+        assert_eq!(classify(200, &none, 60), Verdict::Done);
+        assert_eq!(classify(400, &none, 60), Verdict::Done);
+        assert_eq!(classify(404, &none, 60), Verdict::Done);
+        assert_eq!(
+            classify(429, &none, 60),
+            Verdict::Retry { cooldown: Some(60) }
+        );
+        assert_eq!(
+            classify(429, &headers(&[("retry-after", "17")]), 60),
+            Verdict::Retry { cooldown: Some(17) }
+        );
+        assert_eq!(
+            classify(403, &none, 60),
+            Verdict::Retry {
+                cooldown: Some(1800)
+            }
+        );
+        assert_eq!(classify(401, &none, 60), Verdict::Reauth);
+        for s in [500, 502, 503, 504, 529] {
+            assert_eq!(classify(s, &none, 60), Verdict::Retry { cooldown: None });
+        }
+    }
+
+    #[test]
+    fn reset_after_sources() {
+        let now = 1_000_000;
+        assert_eq!(reset_after(&headers(&[("retry-after", "0")]), now), Some(1));
+        assert_eq!(
+            reset_after(
+                &headers(&[("anthropic-ratelimit-unified-reset", "1000300")]),
+                now
+            ),
+            Some(300)
+        );
+        // Earliest future reset among the other limit headers; past ones ignored.
+        let h = headers(&[
+            ("anthropic-ratelimit-tokens-reset", "1970-01-12T13:53:20Z"),
+            ("anthropic-ratelimit-requests-reset", "1000050"),
+            ("anthropic-ratelimit-input-tokens-reset", "999000"),
+        ]);
+        assert_eq!(reset_after(&h, now), Some(50));
+        assert_eq!(
+            reset_after(
+                &headers(&[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+                now
+            ),
+            None
+        );
     }
 
     #[test]

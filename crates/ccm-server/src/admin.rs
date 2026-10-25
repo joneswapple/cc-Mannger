@@ -105,6 +105,9 @@ pub enum UserCommand {
         daily_tokens: Option<i64>,
         #[arg(long)]
         rpm: Option<i64>,
+        /// Only use upstream accounts in this group; empty string clears it.
+        #[arg(long)]
+        group: Option<String>,
     },
 }
 
@@ -122,6 +125,28 @@ pub enum KeyCommand {
 #[derive(Subcommand)]
 pub enum AccountCommand {
     List,
+    /// Change scheduling settings of an upstream account.
+    Set {
+        id: i64,
+        #[arg(long)]
+        label: Option<String>,
+        /// Higher is preferred by the `priority` strategy.
+        #[arg(long)]
+        priority: Option<i64>,
+        /// Share under the `round_robin` strategy.
+        #[arg(long)]
+        weight: Option<i64>,
+        /// Account group; empty string removes it.
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        /// Lift an active cooldown.
+        #[arg(long)]
+        clear_cooldown: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,9 +199,10 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             allow,
             daily_tokens,
             rpm,
+            group,
         }) => {
             let path = format!("/admin/api/users/{id}/policy");
-            if allow.is_none() && daily_tokens.is_none() && rpm.is_none() {
+            if allow.is_none() && daily_tokens.is_none() && rpm.is_none() && group.is_none() {
                 c.get(&path).await?
             } else {
                 let allowed: Option<Vec<String>> =
@@ -186,7 +212,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                             .filter(|m| !m.is_empty())
                             .collect()
                     });
-                c.post(&path, json!({"allowed_models": allowed, "daily_token_limit": daily_tokens, "rpm_limit": rpm}))
+                c.post(&path, json!({"allowed_models": allowed, "daily_token_limit": daily_tokens, "rpm_limit": rpm, "account_group": group}))
                     .await?
             }
         }
@@ -199,6 +225,34 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 .await?
         }
         AdminCommand::Account(AccountCommand::List) => c.get("/admin/api/accounts").await?,
+        AdminCommand::Account(AccountCommand::Set {
+            id,
+            label,
+            priority,
+            weight,
+            group,
+            enable,
+            disable,
+            clear_cooldown,
+        }) => {
+            let enabled = match (enable, disable) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            c.post(
+                &format!("/admin/api/accounts/{id}"),
+                json!({
+                    "label": label,
+                    "priority": priority,
+                    "weight": weight,
+                    "account_group": group,
+                    "enabled": enabled,
+                    "clear_cooldown": clear_cooldown,
+                }),
+            )
+            .await?
+        }
         AdminCommand::Models(ModelsCommand::List) => c.get("/admin/api/settings").await?,
         AdminCommand::Models(ModelsCommand::Disable { models }) => {
             c.post(
