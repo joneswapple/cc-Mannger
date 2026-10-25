@@ -27,8 +27,7 @@ index.html, package.json   # Vite 入口
 scripts/                   # install.sh / install.ps1 等
 ```
 
-Go 版（`cmd/`、`internal/`）在阶段 R1 功能对齐并通过测试后删除。Go 版阶段 0
-（数据库账号、AES-GCM 加密）已经完成，作为 Rust 版的行为参考。
+**进度**：R0、R1 已完成，Go 版 cliproxy 已删除（旧数据用 `ccm-server migrate-from-go` 迁移）。
 
 ## 2. 功能对照
 
@@ -54,7 +53,7 @@ Go 版（`cmd/`、`internal/`）在阶段 R1 功能对齐并通过测试后删�
 每个阶段一个可独立合并的提交组；结束时 `cargo fmt --check`、`cargo clippy -D warnings`、
 `cargo test --workspace`、`pnpm build`、`pnpm typecheck` 全部通过。
 
-### R0：脚手架与数据层
+### R0：脚手架与数据层（已完成）
 
 - Cargo workspace；`ccm-core` 实现：
   - 配置：默认值 → `config.json`（应用数据目录）→ `CCM_*` 环境变量。
@@ -67,7 +66,7 @@ Go 版（`cmd/`、`internal/`）在阶段 R1 功能对齐并通过测试后删�
 - 前端：Vite + React + TS + Tailwind 骨架，调用 `/healthz` 显示服务状态。
 - 测试：加密往返、迁移幂等、导入、fake OAuth server 下的刷新 / 同步 / needs_reauth。
 
-### R1：代理功能与 Go 版对齐，然后删除 Go 代码
+### R1：代理功能与 Go 版对齐，然后删除 Go 代码（已完成）
 
 - Axum：`POST /v1/messages`（SSE 逐行透传 + 从 `message_start` / `message_delta` 抓 usage）、
   `/v1/messages/count_tokens`、`/v1/models`（缓存目录）。

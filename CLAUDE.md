@@ -4,129 +4,84 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-cliproxy is a single-binary Go server that lets a LAN of terminals share one
-logged-in Claude Code CLI session. The operator runs `claude /login` once on
-the host; cliproxy reads that host's OAuth credentials, refreshes them on
-demand, and forwards Anthropic Messages API requests from per-terminal API
-keys it issues itself. See `README.md` for the user-facing walkthrough.
+CC Manager lets a LAN of terminals share logged-in Claude Pro/Max OAuth
+accounts. It holds the accounts' tokens (encrypted), refreshes them, and
+forwards Anthropic Messages API requests from per-terminal `sk-cp-…` keys it
+issues itself. It is a Tauri v2 desktop app plus a headless server over one
+Rust core, modelled on lbjlaq/Antigravity-Manager. Claude OAuth accounts
+only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
+(R0 scaffold and R1 Go parity are done; the Go cliproxy has been removed).
 
-## Rust rewrite (in progress)
+## Build / run / test
 
-The project is being rewritten as **CC Manager** — a Tauri v2 desktop app
-modelled on lbjlaq/Antigravity-Manager, Claude OAuth accounts only (no
-Anthropic API-key accounts). The phase plan is `docs/ROADMAP.zh.md`. The Go
-code below stays until phase R1 reaches parity, then gets deleted.
+- `cargo test --workspace` — all Rust tests (`crates/ccm-core/tests/proxy.rs`
+  runs the HTTP layer end to end against a fake upstream).
+- `cargo test -p ccm-core --test proxy streams_sse` — a single test.
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all --check` — must stay clean.
+- `pnpm install && pnpm build` (`pnpm typecheck` for types only) — the UI.
+- `cargo run -p ccm-server -- serve` — headless server; prints the admin
+  token on first start. `pnpm tauri dev` — desktop app.
+- Building `src-tauri` on Linux needs `libwebkit2gtk-4.1-dev`,
+  `libayatana-appindicator3-dev`, `librsvg2-dev`.
 
-- `crates/ccm-core` — all logic, no GUI deps: `config.rs` (defaults →
-  `config.json` → `CCM_*` env), `store.rs` (rusqlite, embedded migrations
-  tracked in `schema_migrations`), `secret.rs` (AES-256-GCM, key from
-  `CCM_SECRET_KEY` or auto-created `data_dir/secret.key`), `accounts.rs`,
-  `oauth.rs` (credentials file shapes, refresh), `provider.rs`
-  (`AccountProvider`, `AccountPool`, first-start import), `http.rs` (Axum).
-- `crates/ccm-server` — headless binary (`ccm-server serve|config`).
-- `src-tauri` — desktop shell: runs the core server in-process, tray icon,
-  Tauri commands for the UI. Bundles NSIS / AppImage / deb / dmg.
-- `src/` + `index.html` — React + TypeScript + Vite + Tailwind UI shared by
-  both shells; `src/api.ts` picks Tauri `invoke` or HTTP.
+## Architecture
 
-Commands: `cargo test --workspace`, `cargo clippy --workspace --all-targets
--- -D warnings`, `cargo fmt --all --check`, `pnpm install`, `pnpm build`,
-`pnpm tauri dev` (desktop), `cargo run -p ccm-server` (headless). Building
-`src-tauri` on Linux needs `libwebkit2gtk-4.1-dev`,
-`libayatana-appindicator3-dev` and `librsvg2-dev`.
-
-Any new UI capability needs both a Tauri command (desktop) and an
-`/admin/api/*` endpoint (headless), wrapped once in `src/api.ts`.
-
-## Build / run / test (Go version)
-
-- `go build ./cmd/cliproxy` — single static binary, no CGO required
-  (modernc.org/sqlite is pure Go).
-- `go test ./...` — runs the suite.
-- `go test ./internal/server -run TestProxy` — single subtest pattern.
-- `go vet ./...` — must stay clean.
-- `./cliproxy serve --config path/to/config.yaml` — run the server. On first
-  run an admin token is printed to stdout.
-- `./cliproxy admin invite create --label foo` — admin subcommands hit the
-  local server's admin API (uses `CLIPROXY_ADMIN_TOKEN` and `CLIPROXY_ADMIN_URL`).
-
-## Architecture (the parts that span files)
-
-- `cmd/cliproxy/main.go` is the cobra entry point. `serve` wires every
-  long-lived component (`store`, `auth.Keys`, `auth.Invites`, `auth.Admin`,
-  `upstream.ClaudeCLIProvider`, `upstream.Client`, `policy.Engine`,
-  `stats.Recorder`, `server.Server`) and starts the HTTP listener.
-- `internal/store` owns the SQLite connection. Migrations are embedded under
-  `internal/store/migrations/` via `embed.FS`; `Open` applies the ones not yet
-  listed in `schema_migrations`, so new migrations may use non-idempotent
-  statements like `ALTER TABLE … ADD COLUMN`.
-- `internal/secret` seals tokens with AES-256-GCM (key from `secret_key` /
-  `CLIPROXY_SECRET_KEY`, else `data_dir/secret.key`, auto-created).
-- `internal/accounts` stores upstream Claude OAuth accounts; tokens live
-  encrypted in `account_secrets`. Only OAuth accounts are supported — no
-  Anthropic API-key accounts (see `docs/ROADMAP.zh.md`).
-- `internal/auth`
-  - `keys.go` issues `sk-cp-…` keys (bcrypt-hashed, 8-char prefix index for
-    fast lookup, in-memory cache with 60s TTL).
-  - `invite.go` issues single-use invite tokens (only the sha256 is stored).
-  - `admin.go` bootstraps the dashboard admin token and verifies it.
-- `internal/upstream`
-  - `provider.go` defines `CredentialProvider`. Future Bedrock/Vertex/API-key
-    providers should implement this interface.
-  - `account.go` holds `AccountProvider` (DB-backed token + refresh, optional
-    sync with a credentials file), `AccountPool` (picks the account per
-    call) and `ImportCLICredentials` (seeds account #1 on first start).
-  - `claudecli.go` reads the Claude Code CLI credentials file and refreshes
-    via the OAuth token endpoint. The OAuth URL, client_id, and
-    `anthropic-beta` header are config-driven because they're not officially
-    documented.
-  - `client.go` is the upstream HTTP client. It asks its `AccountPicker` for
-    an account on every call, reports the account ID back from `Forward`
-    (recorded in `usage_events.account_id`), and injects `Authorization: Bearer`,
-    `anthropic-version`, `anthropic-beta`, and `User-Agent` for every forward.
-- `internal/policy/policy.go` is the request-time gate (model allowlist,
-  global denylist, in-memory RPM bucket, DB-backed daily token quota).
-- `internal/stats/recorder.go` is async — handlers push events on a channel
-  and a goroutine writes them; aggregation queries are also defined here.
-- `internal/server`
-  - `server.go` builds the chi router and embeds `templates/*.html` and
-    `static/*` so the binary is self-contained.
-  - `proxy.go` handles `POST /v1/messages`. SSE responses are streamed
-    line-by-line to the client while teeing through an SSE parser that
-    captures token usage from `message_start` and `message_delta` events;
-    non-SSE responses are buffered just enough to parse the trailing `usage`
-    object.
-  - `admin_api.go` exposes JSON endpoints under `/admin/api/*`. The
-    `cliproxy admin …` CLI is a thin wrapper over these.
-  - `dashboard.go` renders the HTML pages (server-rendered with
-    `html/template`; the only JS is small inline `fetch` calls, no
-    framework).
-  - `middleware.go` holds `requireAPIKey` and `requireAdmin`. API errors are
-    returned in Anthropic's `{type:"error",error:{type,message}}` shape so
-    Claude Code surfaces them sensibly.
+- `crates/ccm-core` — all logic, no GUI dependencies. `Core` (lib.rs) wires
+  every long-lived component once; it is cheap to clone and is the Axum state.
+  - `config.rs` — defaults → `config.json` → `CCM_*` env.
+  - `store.rs` — one rusqlite connection behind a mutex; migrations in
+    `migrations/*.sql` are listed in `MIGRATIONS` and recorded in
+    `schema_migrations`, so a new migration may be non-idempotent. Never hold
+    `store.conn()` across an `.await`.
+  - `secret.rs` — AES-256-GCM; AAD binds ciphertext to `account:{id}:{field}`.
+  - `accounts.rs` — upstream OAuth accounts; tokens only in `account_secrets`.
+  - `oauth.rs` — Claude Code credentials file shapes, atomic rewrite, refresh.
+  - `provider.rs` — `AccountProvider` (per-account token + refresh, optional
+    two-way sync with a credentials file, `needs_reauth` on invalid_grant),
+    `AccountPool` (picks the account per call), first-start import.
+  - `auth/` — `sk-cp-` keys (bcrypt, 12-char prefix index, Go 8-char prefixes
+    still resolve, 60 s cache keyed by sha256), invites (sha256 only),
+    admin token (bcrypt in `global_settings`).
+  - `policy.rs` — global denylist, allowlist, RPM bucket, daily quota.
+  - `stats.rs` — `Recorder` writes on its own thread via a bounded channel
+    (`flush()` for tests); rollups and the usage search.
+  - `upstream.rs` — reqwest client injecting Bearer, `anthropic-version`,
+    merged `anthropic-beta`, User-Agent; `Catalog` caches `/v1/models`.
+  - `rewrite.rs` — effort-tier expansion and Claude Code system injection
+    (key order preserved via serde_json `preserve_order`).
+  - `capture.rs` — usage / error extraction; `TeeStream` passes SSE bytes
+    through and reports once on end, error or client disconnect.
+  - `http/` — `mod.rs` router, `ApiIdentity` / `AdminAuth` extractors and
+    error helpers; `proxy.rs` the `/v1` handlers; `admin.rs` `/admin/api/*`
+    and `/register`.
+- `crates/ccm-server` — headless binary: `serve`, `config`, `admin …`
+  (HTTP client over `/admin/api/*`, except `reset-token`), `effort …`,
+  `migrate-from-go`.
+- `src-tauri` — desktop shell: runs `ccm_core::http::serve` in-process, tray,
+  hide-to-tray, Tauri commands. NSIS / AppImage / deb / dmg bundles.
+- `src/` + `index.html` — React + TypeScript + Vite + Tailwind UI for both
+  shells; `src/api.ts` picks Tauri `invoke` or HTTP.
 
 ## Conventions worth knowing
 
-- **No CGO.** Stick to `modernc.org/sqlite`. Don't add a dependency that
-  pulls in libc.
-- **Embedded assets.** All templates and CSS are embedded into the binary
-  (`internal/server/templates/`, `internal/server/static/`). Add new pages
-  there, not in a separate `web/` tree.
-- **Anthropic error shape.** Any error returned from `/v1/messages` (or the
-  middleware that protects it) must be the Anthropic-shaped JSON, not a
-  generic JSON error. See `writeAnthropicError` in `internal/server/middleware.go`.
-- **Single-shown secrets.** Invite tokens, fresh API keys, and the bootstrap
-  admin token are returned exactly once. Never log them.
-- **Config precedence:** defaults → YAML file → `CLIPROXY_*` env vars. New
-  options should follow that pattern in `internal/config/config.go`.
+- **Anthropic error shape.** Everything under `/v1/*` (including auth
+  rejections) returns `{"type":"error","error":{type,message}}` via
+  `http::anthropic_error`. Admin endpoints use `http::json_error`.
+- **Single-shown secrets.** Invite tokens, new API keys and generated admin
+  tokens are returned exactly once. Never log them or upstream tokens.
+  Admin responses never include token material (account list is metadata).
+- **bcrypt off the async workers.** Key lookup, invite redeem, key issue and
+  admin verify run in `spawn_blocking`.
+- **New admin actions** need an `/admin/api/*` endpoint, a
+  `ccm-server admin …` subcommand, and (once the UI covers it) a Tauri
+  command, wrapped once in `src/api.ts`.
+- **Upstream wire format** (headers, OAuth) changes go in `upstream.rs` /
+  `oauth.rs`, with a fake-server test.
+- **Config precedence:** defaults → `config.json` → `CCM_*` env; add new
+  options to `config.rs` (`Default` impl + `apply_env` when overridable).
 
 ## Working in this repo
 
-- The default development branch for AI-driven changes in the current task
-  is `claude/add-claude-documentation-rpN2g`. `main` is the upstream default.
-- When changing the upstream wire format (headers, OAuth flow), update both
-  `internal/upstream/claudecli.go` and `internal/upstream/client.go`, and
-  add a fake-server unit test in `internal/upstream/claudecli_test.go`.
-- When adding admin actions, expose them as both an `/admin/api/*` JSON
-  endpoint and a `cliproxy admin …` cobra subcommand so users can drive the
-  proxy without the dashboard.
+- Development branch for the current task: `claude/epic-gauss-en0jx3`.
+  `main` is the upstream default.

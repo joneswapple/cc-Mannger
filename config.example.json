@@ -1,0 +1,27 @@
+{
+  "listen": "0.0.0.0:8787",
+  "data_dir": "~/.local/share/cc-manager",
+  "log_level": "info",
+  "secret_key": "",
+  "upstream": {
+    "base_url": "https://api.anthropic.com",
+    "credentials_path": "",
+    "oauth_token_url": "https://console.anthropic.com/v1/oauth/token",
+    "oauth_client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    "anthropic_beta": "claude-code-20250219,oauth-2025-04-20",
+    "user_agent": "claude-cli/1.0 (cc-manager)",
+    "inject_claude_code_system": true,
+    "sync_credentials_file": true,
+    "effort_levels": {
+      "auto": { "max_tokens": 8192, "thinking_budget": 0 },
+      "low": { "max_tokens": 4096, "thinking_budget": 0 },
+      "medium": { "max_tokens": 16384, "thinking_budget": 5000 },
+      "high": { "max_tokens": 32768, "thinking_budget": 15000 },
+      "xhigh": { "max_tokens": 48000, "thinking_budget": 30000 },
+      "max": { "max_tokens": 64000, "thinking_budget": 60000 }
+    }
+  },
+  "admin": {
+    "initial_token": ""
+  }
+}

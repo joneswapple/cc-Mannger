@@ -53,6 +53,11 @@ impl SecretBox {
             .map_err(|_| anyhow!("secret: decrypt failed (wrong key?)"))
     }
 
+    /// A key given as base64 text, e.g. the contents of a `secret.key` file.
+    pub fn from_base64(s: &str) -> Result<Self> {
+        Self::new(&decode_key(s)?)
+    }
+
     /// Resolves the key: a configured base64 value wins; otherwise
     /// `data_dir/secret.key` is read, or created with a random key (0600).
     pub fn load(configured: &str, data_dir: &Path) -> Result<Self> {

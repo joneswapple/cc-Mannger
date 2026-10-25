@@ -25,6 +25,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = app.path().app_config_dir()?.join("config.json");
     let cfg = Config::load(Some(&config_path))?;
     let (core, startup) = Core::open(cfg)?;
+    // The desktop UI talks to the core directly; the admin API (for
+    // headless use from other machines) only gets a token when one is
+    // configured or set later with `ccm-server admin reset-token`.
+    if !core.config.admin.initial_token.is_empty() {
+        core.admin.bootstrap(&core.config.admin.initial_token)?;
+    }
     if let Some(id) = startup.imported_account {
         tracing::info!("imported Claude Code credentials as upstream account #{id}");
     }

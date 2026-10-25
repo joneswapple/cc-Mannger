@@ -9,7 +9,13 @@ use rusqlite::{Connection, OptionalExtension};
 /// Migrations in apply order. Each runs once, inside a transaction, and is
 /// recorded in `schema_migrations`, so later ones may use non-idempotent
 /// statements such as `ALTER TABLE … ADD COLUMN`.
-const MIGRATIONS: &[(&str, &str)] = &[("001_init", include_str!("../migrations/001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("001_init", include_str!("../migrations/001_init.sql")),
+    (
+        "002_key_prefix_index",
+        include_str!("../migrations/002_key_prefix_index.sql"),
+    ),
+];
 
 pub const DB_FILE: &str = "cc-manager.db";
 

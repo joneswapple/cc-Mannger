@@ -1,6 +1,7 @@
 //! Configuration: code defaults → `config.json` → `CCM_*` environment
 //! variables, in that order of precedence.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -39,6 +40,41 @@ pub struct UpstreamConfig {
     /// refreshes, rewritten after) so the host's `claude` CLI and CC Manager
     /// don't invalidate each other's refresh token.
     pub sync_credentials_file: bool,
+    /// OpenAI-style effort tiers (`"effort":"high"` in a request body)
+    /// expanded into Anthropic `max_tokens` + extended-thinking budget.
+    pub effort_levels: BTreeMap<String, EffortLevel>,
+}
+
+/// One effort tier. Applied only where the request doesn't already set
+/// `max_tokens` / `thinking`; explicit values always win.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EffortLevel {
+    pub max_tokens: i64,
+    /// When > 0, also enables extended thinking with this `budget_tokens`.
+    pub thinking_budget: i64,
+}
+
+pub fn default_effort_levels() -> BTreeMap<String, EffortLevel> {
+    [
+        ("auto", 8192, 0),
+        ("low", 4096, 0),
+        ("medium", 16384, 5000),
+        ("high", 32768, 15000),
+        ("xhigh", 48000, 30000),
+        ("max", 64000, 60000),
+    ]
+    .into_iter()
+    .map(|(name, max_tokens, thinking_budget)| {
+        (
+            name.to_string(),
+            EffortLevel {
+                max_tokens,
+                thinking_budget,
+            },
+        )
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -73,6 +109,7 @@ impl Default for UpstreamConfig {
             user_agent: "claude-cli/1.0 (cc-manager)".into(),
             inject_claude_code_system: true,
             sync_credentials_file: true,
+            effort_levels: default_effort_levels(),
         }
     }
 }

@@ -40,7 +40,7 @@ export default function App() {
       <section className="grid gap-4 sm:grid-cols-3">
         <Stat label="服务状态" value={status ? "运行中" : error ? "未连接" : "…"} />
         <Stat label="监听地址" value={status?.listen ?? "—"} mono />
-        <Stat label="上游账号" value={status ? String(status.accounts) : "—"} />
+        <Stat label="上游账号" value={status?.accounts !== undefined ? String(status.accounts) : "—"} />
       </section>
 
       <section className="mt-6 rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
