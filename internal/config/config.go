@@ -10,11 +10,15 @@ import (
 )
 
 type Config struct {
-	Listen   string         `yaml:"listen"`
-	DataDir  string         `yaml:"data_dir"`
-	LogLevel string         `yaml:"log_level"`
-	Upstream UpstreamConfig `yaml:"upstream"`
-	Admin    AdminConfig    `yaml:"admin"`
+	Listen   string `yaml:"listen"`
+	DataDir  string `yaml:"data_dir"`
+	LogLevel string `yaml:"log_level"`
+	// SecretKey is a base64-encoded 32-byte AES key sealing upstream
+	// account tokens in the database. Empty means use (or create)
+	// data_dir/secret.key.
+	SecretKey string         `yaml:"secret_key"`
+	Upstream  UpstreamConfig `yaml:"upstream"`
+	Admin     AdminConfig    `yaml:"admin"`
 }
 
 type UpstreamConfig struct {
@@ -30,6 +34,12 @@ type UpstreamConfig struct {
 	// Disable only if your client (e.g. `claude` itself) already prepends
 	// the identifier and you want byte-for-byte passthrough.
 	InjectClaudeCodeSystem bool `yaml:"inject_claude_code_system"`
+	// SyncCredentialsFile applies when the accounts table is seeded from
+	// the host's Claude Code credentials file on first start: the file
+	// stays authoritative (re-read before refreshes, rewritten after) so
+	// the host's own `claude` CLI and cliproxy don't invalidate each
+	// other's refresh token. Default true.
+	SyncCredentialsFile bool `yaml:"sync_credentials_file"`
 	// EffortLevels maps OpenAI-style effort tiers (low/medium/high/…)
 	// to Anthropic's `max_tokens` + extended-thinking `budget_tokens`.
 	// Clients that send `"effort":"<tier>"` get expanded to the
@@ -73,6 +83,7 @@ func Default() Config {
 			AnthropicBeta:          "claude-code-20250219,oauth-2025-04-20",
 			UserAgent:              "claude-cli/1.0 (cliproxy)",
 			InjectClaudeCodeSystem: true,
+			SyncCredentialsFile:    true,
 			EffortLevels: map[string]EffortLevel{
 				"auto":   {MaxTokens: 8192},
 				"low":    {MaxTokens: 4096},
@@ -120,6 +131,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CLIPROXY_CREDENTIALS_PATH"); v != "" {
 		c.Upstream.CredentialsPath = v
+	}
+	if v := os.Getenv("CLIPROXY_SECRET_KEY"); v != "" {
+		c.SecretKey = v
+	}
+	if v := os.Getenv("CLIPROXY_SYNC_CREDENTIALS_FILE"); v != "" {
+		c.Upstream.SyncCredentialsFile = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v := os.Getenv("CLIPROXY_ADMIN_TOKEN"); v != "" {
 		c.Admin.InitialToken = v

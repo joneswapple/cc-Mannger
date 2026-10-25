@@ -17,9 +17,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/hubosdev/cliproxy/internal/accounts"
 	"github.com/hubosdev/cliproxy/internal/auth"
 	"github.com/hubosdev/cliproxy/internal/config"
 	"github.com/hubosdev/cliproxy/internal/policy"
+	"github.com/hubosdev/cliproxy/internal/secret"
 	"github.com/hubosdev/cliproxy/internal/server"
 	"github.com/hubosdev/cliproxy/internal/stats"
 	"github.com/hubosdev/cliproxy/internal/store"
@@ -91,13 +93,22 @@ func serveCmd() *cobra.Command {
 				fmt.Printf("\n=== ADMIN TOKEN (save now, only shown once) ===\n%s\n===============================================\n\n", tok)
 			}
 
-			provider, err := upstream.NewClaudeCLIProvider(cfg.Upstream.CredentialsPath, cfg.Upstream.OAuthTokenURL, cfg.Upstream.OAuthClientID)
+			box, err := secret.Load(cfg.SecretKey, cfg.DataDir)
+			if err != nil {
+				return err
+			}
+			accts := accounts.New(st, box)
+			imported, err := upstream.ImportCLICredentials(ctx, accts, cfg.Upstream.CredentialsPath, cfg.Upstream.SyncCredentialsFile)
 			if err != nil {
 				return fmt.Errorf("upstream credentials: %w", err)
 			}
-			fmt.Printf("upstream credentials: %s\n", provider.Source())
+			if imported > 0 {
+				fmt.Printf("imported Claude Code credentials as upstream account #%d\n", imported)
+			}
+			pool := upstream.NewAccountPool(accts, cfg.Upstream.OAuthTokenURL, cfg.Upstream.OAuthClientID)
+			fmt.Printf("upstream credentials: %s\n", pool.Source())
 
-			client := upstream.NewClient(cfg.Upstream.BaseURL, cfg.Upstream.UserAgent, cfg.Upstream.AnthropicBeta, provider)
+			client := upstream.NewPoolClient(cfg.Upstream.BaseURL, cfg.Upstream.UserAgent, cfg.Upstream.AnthropicBeta, pool)
 			catalog := upstream.NewCatalog(client, 30*time.Minute)
 			catalog.Start(ctx)
 

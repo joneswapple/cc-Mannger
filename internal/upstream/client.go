@@ -11,16 +11,22 @@ import (
 
 type Client struct {
 	BaseURL       string
-	Provider      CredentialProvider
+	Picker        AccountPicker
 	HTTP          *http.Client
 	UserAgent     string
 	AnthropicBeta string
 }
 
+// NewClient forwards every call with one fixed credential provider.
 func NewClient(baseURL, userAgent, beta string, p CredentialProvider) *Client {
+	return NewPoolClient(baseURL, userAgent, beta, staticPicker{p})
+}
+
+// NewPoolClient asks picker for the account to use on every call.
+func NewPoolClient(baseURL, userAgent, beta string, picker AccountPicker) *Client {
 	return &Client{
-		BaseURL:  strings.TrimRight(baseURL, "/"),
-		Provider: p,
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		Picker:  picker,
 		HTTP: &http.Client{
 			Timeout: 0, // streaming-friendly; rely on context for cancellation
 			Transport: &http.Transport{
@@ -53,9 +59,13 @@ type ForwardExtra struct {
 	ContentType string
 }
 
-// Forward sends body to the upstream Anthropic API and returns the response.
+// Source describes where upstream credentials come from.
+func (c *Client) Source() string { return c.Picker.Source() }
+
+// Forward sends body to the upstream Anthropic API and returns the response
+// plus the ID of the account that served it (0 for a bare provider).
 // Streaming is the caller's responsibility (just stream resp.Body).
-func (c *Client) Forward(ctx context.Context, path string, body io.Reader, extra ForwardExtra) (*http.Response, error) {
+func (c *Client) Forward(ctx context.Context, path string, body io.Reader, extra ForwardExtra) (*http.Response, int64, error) {
 	return c.do(ctx, http.MethodPost, path, body, extra)
 }
 
@@ -63,17 +73,22 @@ func (c *Client) Forward(ctx context.Context, path string, body io.Reader, extra
 // injection used for /v1/messages. Useful for /v1/models and other
 // metadata endpoints.
 func (c *Client) Get(ctx context.Context, path string) (*http.Response, error) {
-	return c.do(ctx, http.MethodGet, path, nil, ForwardExtra{})
+	resp, _, err := c.do(ctx, http.MethodGet, path, nil, ForwardExtra{})
+	return resp, err
 }
 
-func (c *Client) do(ctx context.Context, method, path string, body io.Reader, extra ForwardExtra) (*http.Response, error) {
-	tok, err := c.Provider.Token(ctx)
+func (c *Client) do(ctx context.Context, method, path string, body io.Reader, extra ForwardExtra) (*http.Response, int64, error) {
+	lease, err := c.Picker.Pick(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire upstream token: %w", err)
+		return nil, 0, fmt.Errorf("pick upstream account: %w", err)
+	}
+	tok, err := lease.Provider.Token(ctx)
+	if err != nil {
+		return nil, lease.AccountID, fmt.Errorf("acquire upstream token: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
 	if err != nil {
-		return nil, err
+		return nil, lease.AccountID, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("anthropic-version", "2023-06-01")
@@ -95,7 +110,8 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ex
 	if ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	return c.HTTP.Do(req)
+	resp, err := c.HTTP.Do(req)
+	return resp, lease.AccountID, err
 }
 
 // mergeBeta combines two comma-separated `anthropic-beta` values,

@@ -75,9 +75,17 @@ of precedence: code defaults → YAML file → `CLIPROXY_*` env vars.
 | `upstream.oauth_client_id`     | —                             | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`                   |
 | `upstream.anthropic_beta`      | —                             | `oauth-2025-04-20`                                       |
 | `upstream.user_agent`          | —                             | `claude-cli/1.0 (cliproxy)`                              |
+| `upstream.sync_credentials_file` | `CLIPROXY_SYNC_CREDENTIALS_FILE` | `true`                                              |
+| `secret_key`                   | `CLIPROXY_SECRET_KEY`         | empty (use / create `data_dir/secret.key`)               |
 | `admin.initial_token`          | `CLIPROXY_ADMIN_TOKEN`        | empty (generate random on first run)                     |
 
-The Claude Code credential file is found in this order:
+Upstream credentials are stored as **accounts** in the database, with tokens
+encrypted (AES-256-GCM) using `secret_key` or `data_dir/secret.key`. Back up
+that key file together with `cliproxy.db`. On first start, when there are no
+accounts yet, the Claude Code credential file is imported as account #1; with
+`sync_credentials_file` on (the default) the file stays authoritative, so the
+host's own `claude` keeps working alongside cliproxy. The file is found in
+this order:
 
 1. `upstream.credentials_path` from config / `CLIPROXY_CREDENTIALS_PATH`
 2. `$CLAUDE_CREDENTIALS_PATH`

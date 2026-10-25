@@ -19,6 +19,12 @@ data_dir: "~/.local/share/cliproxy"
 # debug | info | warn | error
 log_level: "info"
 
+# Base64-encoded 32-byte key that encrypts upstream account tokens in the
+# database (env: CLIPROXY_SECRET_KEY). Leave blank to use data_dir/secret.key,
+# which is generated on first start. Back it up: without it the stored
+# tokens cannot be decrypted. Generate one with: openssl rand -base64 32
+secret_key: ""
+
 upstream:
   # The Anthropic API base URL. Almost always the default.
   base_url: "https://api.anthropic.com"
@@ -33,6 +39,13 @@ upstream:
   #     > ~/.claude/.credentials.json
   # and point this option at the resulting file.
   credentials_path: ""
+
+  # On first start, when no upstream accounts exist yet, the credentials
+  # file above is imported as account #1. With sync on, that file stays
+  # authoritative: it is re-read before refreshes and rewritten after, so
+  # the host's own `claude` CLI and cliproxy keep sharing one refresh token.
+  # (env: CLIPROXY_SYNC_CREDENTIALS_FILE)
+  sync_credentials_file: true
 
   # OAuth refresh endpoint and CLI client ID. These are not officially
   # documented; the defaults match what the public Claude Code CLI uses

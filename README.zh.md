@@ -71,6 +71,8 @@ claude
 | `upstream.oauth_client_id`     | —                              | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`                   |
 | `upstream.anthropic_beta`      | —                              | `oauth-2025-04-20`                                       |
 | `upstream.user_agent`          | —                              | `claude-cli/1.0 (cliproxy)`                              |
+| `upstream.sync_credentials_file` | `CLIPROXY_SYNC_CREDENTIALS_FILE` | `true`                                               |
+| `secret_key`                   | `CLIPROXY_SECRET_KEY`          | 空（使用 / 生成 `data_dir/secret.key`）                   |
 | `admin.initial_token`          | `CLIPROXY_ADMIN_TOKEN`         | 空（首启动时随机生成）                                    |
 
 凭据文件查找顺序：

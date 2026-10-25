@@ -29,7 +29,14 @@ keys it issues itself. See `README.md` for the user-facing walkthrough.
   `upstream.ClaudeCLIProvider`, `upstream.Client`, `policy.Engine`,
   `stats.Recorder`, `server.Server`) and starts the HTTP listener.
 - `internal/store` owns the SQLite connection. Migrations are embedded under
-  `internal/store/migrations/` via `embed.FS` and applied on `Open`.
+  `internal/store/migrations/` via `embed.FS`; `Open` applies the ones not yet
+  listed in `schema_migrations`, so new migrations may use non-idempotent
+  statements like `ALTER TABLE … ADD COLUMN`.
+- `internal/secret` seals tokens with AES-256-GCM (key from `secret_key` /
+  `CLIPROXY_SECRET_KEY`, else `data_dir/secret.key`, auto-created).
+- `internal/accounts` stores upstream Claude OAuth accounts; tokens live
+  encrypted in `account_secrets`. Only OAuth accounts are supported — no
+  Anthropic API-key accounts (see `docs/ROADMAP.zh.md`).
 - `internal/auth`
   - `keys.go` issues `sk-cp-…` keys (bcrypt-hashed, 8-char prefix index for
     fast lookup, in-memory cache with 60s TTL).
@@ -38,11 +45,16 @@ keys it issues itself. See `README.md` for the user-facing walkthrough.
 - `internal/upstream`
   - `provider.go` defines `CredentialProvider`. Future Bedrock/Vertex/API-key
     providers should implement this interface.
+  - `account.go` holds `AccountProvider` (DB-backed token + refresh, optional
+    sync with a credentials file), `AccountPool` (picks the account per
+    call) and `ImportCLICredentials` (seeds account #1 on first start).
   - `claudecli.go` reads the Claude Code CLI credentials file and refreshes
     via the OAuth token endpoint. The OAuth URL, client_id, and
     `anthropic-beta` header are config-driven because they're not officially
     documented.
-  - `client.go` is the upstream HTTP client that injects `Authorization: Bearer`,
+  - `client.go` is the upstream HTTP client. It asks its `AccountPicker` for
+    an account on every call, reports the account ID back from `Forward`
+    (recorded in `usage_events.account_id`), and injects `Authorization: Bearer`,
     `anthropic-version`, `anthropic-beta`, and `User-Agent` for every forward.
 - `internal/policy/policy.go` is the request-time gate (model allowlist,
   global denylist, in-memory RPM bucket, DB-backed daily token quota).

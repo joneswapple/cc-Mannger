@@ -16,6 +16,7 @@ type Event struct {
 	Timestamp           time.Time
 	UserID              int64
 	KeyID               int64
+	AccountID           int64 // upstream account; 0 when unknown
 	Model               string
 	InputTokens         int64
 	OutputTokens        int64
@@ -61,14 +62,21 @@ func (r *Recorder) run(ctx context.Context) {
 func (r *Recorder) write(ctx context.Context, e Event) error {
 	_, err := r.s.DB.ExecContext(ctx, `
 		INSERT INTO usage_events(
-			ts, user_id, key_id, model,
+			ts, user_id, key_id, account_id, model,
 			input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
 			latency_ms, status, error)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		e.Timestamp.Unix(), e.UserID, e.KeyID, e.Model,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		e.Timestamp.Unix(), e.UserID, e.KeyID, nullInt(e.AccountID), e.Model,
 		e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheCreationTokens,
 		e.Latency.Milliseconds(), e.Status, nullString(e.Error))
 	return err
+}
+
+func nullInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 func nullString(s string) any {

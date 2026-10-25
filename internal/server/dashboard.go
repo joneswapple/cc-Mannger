@@ -511,7 +511,7 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := settingsView{
-		UpstreamSource:  s.upstream.Provider.Source(),
+		UpstreamSource:  s.upstream.Source(),
 		UpstreamBaseURL: s.cfg.Upstream.BaseURL,
 		AnthropicBeta:   s.cfg.Upstream.AnthropicBeta,
 		OAuthTokenURL:   s.cfg.Upstream.OAuthTokenURL,

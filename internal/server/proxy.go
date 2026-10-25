@@ -106,7 +106,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	resp, err := s.upstream.Forward(r.Context(), "/v1/messages", bytes.NewReader(bodyBytes), upstream.ForwardExtra{
+	resp, accountID, err := s.upstream.Forward(r.Context(), "/v1/messages", bytes.NewReader(bodyBytes), upstream.ForwardExtra{
 		ExtraBeta:   r.Header.Get("anthropic-beta"),
 		UserAgent:   passthroughUserAgent(r.Header.Get("User-Agent")),
 		ContentType: r.Header.Get("Content-Type"),
@@ -114,7 +114,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream: "+err.Error())
 		s.recorder.Record(stats.Event{
-			Timestamp: time.Now(), UserID: id.UserID, KeyID: id.KeyID,
+			Timestamp: time.Now(), UserID: id.UserID, KeyID: id.KeyID, AccountID: accountID,
 			Model: parsed.Model, Latency: time.Since(start),
 			Status: http.StatusBadGateway, Error: err.Error(),
 		})
@@ -146,8 +146,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	errSummary := ""
 	if resp.StatusCode >= 400 || cap.ErrorType != "" {
 		retryAfter := resp.Header.Get("retry-after")
-		log.Printf("upstream error: model=%s user=%d status=%d type=%s request_id=%s retry_after=%s message=%q",
-			parsed.Model, id.UserID, resp.StatusCode, cap.ErrorType, cap.RequestID, retryAfter, cap.ErrorMessage)
+		log.Printf("upstream error: model=%s user=%d account=%d status=%d type=%s request_id=%s retry_after=%s message=%q",
+			parsed.Model, id.UserID, accountID, resp.StatusCode, cap.ErrorType, cap.RequestID, retryAfter, cap.ErrorMessage)
 		errSummary = fmt.Sprintf("%s: %s", nzs(cap.ErrorType, "upstream_error"), nzs(cap.ErrorMessage, http.StatusText(resp.StatusCode)))
 		if cap.RequestID != "" {
 			errSummary += " (req_id=" + cap.RequestID + ")"
@@ -158,6 +158,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		Timestamp:           time.Now(),
 		UserID:              id.UserID,
 		KeyID:               id.KeyID,
+		AccountID:           accountID,
 		Model:               parsed.Model,
 		InputTokens:         cap.Usage.InputTokens,
 		OutputTokens:        cap.Usage.OutputTokens,
@@ -254,7 +255,7 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 			bodyBytes = rewritten
 		}
 	}
-	resp, err := s.upstream.Forward(r.Context(), "/v1/messages/count_tokens", bytes.NewReader(bodyBytes), upstream.ForwardExtra{
+	resp, _, err := s.upstream.Forward(r.Context(), "/v1/messages/count_tokens", bytes.NewReader(bodyBytes), upstream.ForwardExtra{
 		ExtraBeta:   r.Header.Get("anthropic-beta"),
 		UserAgent:   passthroughUserAgent(r.Header.Get("User-Agent")),
 		ContentType: r.Header.Get("Content-Type"),
