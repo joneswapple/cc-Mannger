@@ -56,7 +56,7 @@ SQLite 内嵌、服务端渲染的 `/admin/` 面板、Anthropic 错误格式、�
 - `internal/pool`
   - `Scheduler.Pick(ctx, req) (*Account, release func(result))`
   - 策略：`priority`（默认，按优先级 + 健康度）、`round_robin`、`least_used`（按最近 5h 用量）、
-    以及叠加在上面的 `sticky`（按 API Key / `metadata.user_id` / 会话哈希绑定账号，
+    以及叠加在上面的 `sticky`（按终端的 `sk-cp-…` Key / `metadata.user_id` / 会话哈希绑定账号，
     以保住 prompt cache 命中率；绑定账号不可用时才迁移）。
   - 状态机：`active → cooling(until) → active`；`401/invalid_grant → needs_reauth`；`403 → disabled(reason)`。
   - 冷却时长取自 `retry-after` / `anthropic-ratelimit-*-reset` 响应头，缺省指数退避。
