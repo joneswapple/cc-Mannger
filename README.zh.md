@@ -1,280 +1,198 @@
-# cliproxy（中文文档）
+# CC Manager
 
-cliproxy 是一个用 Go 编写的小型代理服务，让局域网内多台终端共享同一台主机上
-**已经登录** 的 Claude Code CLI 会话。运维人员只需在一台主机上执行
-`claude /login`，cliproxy 会读取该主机的 OAuth 凭据并按需自动刷新，再用它代
-理来自其它终端、各自独立 API Key 的 Anthropic Messages 请求。
+一个桌面程序（Tauri）加一个无界面服务端，让局域网里的多台终端共用你已登录的
+**Claude Pro/Max** 账号。CC Manager 加密保存各账号的 OAuth token、自动刷新、在账号之间
+调度和故障切换，并用它自己签发的终端 Key 转发 Anthropic Messages API 和 OpenAI
+Chat Completions 请求。参考 [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)，
+只针对 Claude。
 
-英文版：[README.md](./README.md)
+English: [README.md](./README.md) · 阶段计划：[docs/ROADMAP.zh.md](./docs/ROADMAP.zh.md)
+
+> **范围说明**：仅用于个人实现与测试，只接入你自己的 Claude OAuth 账号，**不支持**
+> Anthropic API Key 账号。Anthropic 消费者条款不允许共享或转售 Pro/Max 订阅。
 
 ## 功能
 
-- `POST /v1/messages` —— 与 Anthropic 兼容的 Messages 接口，完整透传 SSE 流。
-  客户端只需设置 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_API_KEY`，未经修改的
-  `claude` CLI 就能直接走代理。
-- 邀请码自助注册：每台终端凭一次性邀请码换取自己的 `sk-cp-…` 密钥（数据库中
-  仅保存 bcrypt 哈希，明文仅展示一次）。
-- 用户级策略：启用/停用、允许模型白名单、每分钟请求数（RPM）、每日 token 配
-  额；另叠加一份全局禁用模型黑名单。
-- 用量统计：每次请求记录 token 数、延迟、状态码，并按日 / 用户 / 模型聚合。
-- 内置 HTML 控制台（路由 `/admin/`），可管理邀请码、用户、密钥、策略，并查
-  看用量。
-- 单二进制，无 CGO 依赖，SQLite 存储与前端资源全部嵌入。
+- **代理**：`POST /v1/messages`（Anthropic，SSE 流式透传）和 `POST /v1/chat/completions`
+  （OpenAI 兼容，支持流式、工具调用、图片）。设置 `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY`
+  后原版 `claude` 直接可用。
+- **账号**：OAuth 登录（PKCE）；导入 Claude Code 凭据（文件、批量 JSON、macOS 钥匙串）；
+  首次启动自动导入本机登录；token 用 AES-256-GCM 加密；每个账号可单独配 HTTP/SOCKS5 出站代理。
+- **调度**：优先级 / 加权轮询 / 最少使用；粘性会话保住 prompt cache；429 / 401 / 403 / 5xx
+  自动切换账号并冷却；账号分组；按 5 小时 / 7 天额度用量避开快用完的账号。
+- **终端**：邀请码自助注册；`sk-cp-…` Key（bcrypt 存储、只显示一次）；终端策略（模型白名单、
+  每分钟请求数、每日 token、账号组）；全局禁用模型；模型路由（别名 / 正则）。
+- **管理**：React 网页界面（桌面窗口或浏览器，中 / 英文、浅色 / 深色）、JSON 接口、命令行、Prometheus `/metrics`。
+- **API 反代页**：服务状态与启停、局域网访问与端口、按家族 / 自定义模型映射、后台任务模型、模型连通性测试、
+  接入示例、一键同步到本机 Claude Code（可还原）。
+- **请求监控**：可开关的内存录制，查看客户端请求 / 上游请求 / 响应体、首字耗时、映射后模型、账号与失败切换记录。
+- **统计**：按小时 / 天 / 周的趋势（可按模型、账号、终端拆分）、按可编辑价格表估算费用、活跃时段热力图。
+- **终端**：Key 有效期与续期、24 小时 IP 数上限、每个终端的用量与来源 IP。
+- **公网访问**：一键开启 Cloudflare Tunnel（快速隧道 `*.trycloudflare.com` 或 Token 固定域名），自动下载 cloudflared；
+  隧道走独立监听端口，默认只公开代理入口，不暴露管理后台。
+- **安全**：CIDR 黑 / 白名单（可设有效期）、IP 访问日志与统计（管理后台不受规则影响）。
+- **设置中心**：调度、代理池、额度刷新等运行时可改（存数据库、即时生效），实时运行日志，检查更新。
+- **桌面端**：托盘显示当前账号和额度、快速切换账号、启停代理；账号失效或全部限流时发系统通知；
+  置顶迷你窗口；开机自启。安装包：NSIS（Windows）、AppImage / deb、dmg。
+- **无界面**：`ccm-server` 单个二进制（内嵌网页界面）、Docker 镜像、安装脚本。
 
 ## 快速开始
 
+### 桌面端
+
+从 [Releases](https://github.com/joneswapple/cc-Mannger/releases) 下载安装包（或自行编译，见"开发"）。
+首次启动会导入本机的 Claude Code 登录，并在 8787 端口启动代理。在「上游账号 → OAuth 登录」
+添加更多账号，在「终端」新建终端，在「接入」复制配置片段。
+
+### 无界面
+
 ```sh
-# 1. 编译
-go build -o cliproxy ./cmd/cliproxy
+# 安装（Linux / macOS；Windows 用 scripts/install.ps1），或 cargo build --release -p ccm-server
+curl -fsSL https://raw.githubusercontent.com/joneswapple/cc-Mannger/main/scripts/install.sh | sh
 
-# 2. 在主机上确保已登录 Claude Code：
-#    claude /login   （或运行 claude 走 OAuth 浏览器流程）
-#    凭据默认保存在 ~/.claude/.credentials.json
+ccm-server serve                     # 首次启动打印管理员令牌
+# 浏览器打开 http://<主机>:8787/ ，用管理员令牌登录
+```
 
-# 3. 复制示例配置并按需修改
-cp config.example.yaml config.yaml
+也可以用 Docker：`docker compose up -d`（见 [docker-compose.yml](./docker-compose.yml)），
+管理员令牌在 `docker compose logs` 里。
 
-# 4. 启动代理。首次运行会向 stdout 打印一次性管理员 token，请立即保存。
-./cliproxy serve --config ./config.yaml
+### 接入终端
 
-# 5. 用 token 登录 http://<host>:8787/admin/ ，或调用管理 API 建邀请码：
-curl -X POST http://127.0.0.1:8787/admin/api/invites \
-     -H "Authorization: Bearer <admin-token>" \
-     -H "Content-Type: application/json" \
-     -d '{"label":"alice-laptop","ttl_hours":24}'
+```sh
+# 用邀请码换 Key（邀请码在界面或 `ccm-server admin invite create` 创建）
+curl -X POST http://<主机>:8787/register -H "Content-Type: application/json" \
+     -d '{"token":"<邀请码>","label":"alice"}'
 
-# 6. 在终端用户机上拿邀请码兑换 API Key：
-curl -X POST http://<host>:8787/register \
-     -H "Content-Type: application/json" \
-     -d '{"token":"<invite-token>","label":"alice"}'
-
-# 7. 终端用户把 Claude Code 指向代理即可：
-export ANTHROPIC_BASE_URL=http://<host>:8787
+export ANTHROPIC_BASE_URL=http://<主机>:8787
 export ANTHROPIC_API_KEY=sk-cp-...
 claude
 ```
 
-## 配置文件
+OpenAI 客户端用 `base_url=http://<主机>:8787/v1`，Key 相同。
 
-仓库根目录提供了带注释的示例 [`config.example.yaml`](./config.example.yaml)。
-把它复制为 `config.yaml`（或任意 `--config` 指定的路径）后编辑即可。优先级：
-代码默认值 → YAML 文件 → `CLIPROXY_*` 环境变量。
+## 配置
 
-| YAML 字段                       | 环境变量                       | 默认值                                                    |
-| ------------------------------ | ------------------------------ | -------------------------------------------------------- |
-| `listen`                       | `CLIPROXY_LISTEN`              | `0.0.0.0:8787`                                           |
-| `data_dir`                     | `CLIPROXY_DATA_DIR`            | `~/.local/share/cliproxy`                                |
-| `log_level`                    | `CLIPROXY_LOG_LEVEL`           | `info`                                                   |
-| `upstream.base_url`            | `CLIPROXY_UPSTREAM_BASE_URL`   | `https://api.anthropic.com`                              |
-| `upstream.credentials_path`    | `CLIPROXY_CREDENTIALS_PATH`    | 自动探测（见下文）                                        |
-| `upstream.oauth_token_url`     | —                              | `https://console.anthropic.com/v1/oauth/token`           |
-| `upstream.oauth_client_id`     | —                              | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`                   |
-| `upstream.anthropic_beta`      | —                              | `oauth-2025-04-20`                                       |
-| `upstream.user_agent`          | —                              | `claude-cli/1.0 (cliproxy)`                              |
-| `admin.initial_token`          | `CLIPROXY_ADMIN_TOKEN`         | 空（首启动时随机生成）                                    |
+优先级：代码默认值 → `config.json` → `CCM_*` 环境变量。完整示例见
+[`config.example.json`](./config.example.json)。桌面端读取 `<应用配置目录>/config.json`；
+`ccm-server` 用 `--config` / `CCM_CONFIG` 指定。
 
-凭据文件查找顺序：
+| JSON 字段                            | 环境变量                      | 默认值                                         |
+| ------------------------------------ | ----------------------------- | ---------------------------------------------- |
+| `listen`                             | `CCM_LISTEN`                  | `0.0.0.0:8787`                                 |
+| `data_dir`                           | `CCM_DATA_DIR`                | `<系统数据目录>/cc-manager`                    |
+| `log_level`                          | `CCM_LOG_LEVEL` / `RUST_LOG`  | `info`                                         |
+| `secret_key`                         | `CCM_SECRET_KEY`              | 空 → 使用 / 生成 `data_dir/secret.key`          |
+| `admin.initial_token`                | `CCM_ADMIN_TOKEN`             | 空 → 首次启动随机生成并打印                    |
+| `upstream.base_url`                  | `CCM_UPSTREAM_BASE_URL`       | `https://api.anthropic.com`                    |
+| `upstream.credentials_path`          | `CCM_CREDENTIALS_PATH`        | 自动探测（见下文）                             |
+| `upstream.sync_credentials_file`     | `CCM_SYNC_CREDENTIALS_FILE`   | `true`                                         |
+| `upstream.oauth_*` / `profile_url`   | —                             | 与 Claude Code CLI 一致，见英文文档            |
+| `upstream.usage_url`                 | —                             | 空（不主动轮询，仍从响应头读取额度）           |
+| `upstream.usage_poll_secs`           | —                             | `600`                                          |
+| `upstream.inject_claude_code_system` | —                             | `true`                                         |
+| `pool.strategy`                      | `CCM_POOL_STRATEGY`           | `priority`（可选 `round_robin`、`least_used`） |
+| `pool.sticky`                        | `CCM_POOL_STICKY`             | `true`                                         |
+| `pool.max_retries`                   | `CCM_POOL_MAX_RETRIES`        | `2`                                            |
+| `pool.cooldown_secs`                 | —                             | `60`                                           |
+| `pool.quota_soft_limit`              | —                             | `0.95`                                         |
+| `routing.background_model`           | —                             | 空（关闭）                                     |
+| `routing.background_max_tokens`      | —                             | `512`                                          |
 
-1. 配置文件中的 `upstream.credentials_path` / 环境变量 `CLIPROXY_CREDENTIALS_PATH`
-2. 环境变量 `CLAUDE_CREDENTIALS_PATH`
-3. `$CLAUDE_CONFIG_DIR/.credentials.json`
-4. `$HOME/.claude/.credentials.json`
+OAuth、profile、用量这些接口都没有公开文档，全部做成配置项，Anthropic 改了可以跟着调。
 
-macOS 上 Claude Code 把 OAuth 凭据存在 Keychain 里。在 cliproxy 直接支持
-Keychain 之前，先把它导出成文件再用 `upstream.credentials_path` 指过去：
+**加密密钥**：上游 token 用 `secret_key` 或 `data_dir/secret.key` 加密，请和 `cc-manager.db` 一起备份。
 
-```sh
-security find-generic-password -s "Claude Code-credentials" -w \
-  > ~/.claude/.credentials.json
-```
+**本机登录**：还没有任何账号时，按 `upstream.credentials_path` → `$CLAUDE_CREDENTIALS_PATH` →
+`$CLAUDE_CONFIG_DIR/.credentials.json` → `~/.claude/.credentials.json` 的顺序找到 Claude Code
+凭据并导入为账号 #1。开启 `sync_credentials_file`（默认）时以该文件为准，本机的 `claude` 可以同时使用。
+macOS 用 `ccm-server admin account import --from-keychain` 从钥匙串导入。
 
-## HTTP 接口
+## 账号
 
-| 方法    | 路径                                          | 鉴权                | 说明                                                  |
-| ------- | --------------------------------------------- | ------------------- | ----------------------------------------------------- |
-| `POST`  | `/v1/messages`                                | `x-api-key`         | Anthropic 兼容 Messages 接口（SSE 与 JSON）。          |
-| `POST`  | `/v1/messages/count_tokens`                   | `x-api-key`         | Token 计数转发；同样的鉴权与系统块注入，不计入用量统计。 |
-| `GET`   | `/v1/models`                                  | `x-api-key`         | 从缓存的上游 catalog 返回模型清单。                    |
-| `POST`  | `/register`                                   | 邀请码（请求体）    | 用一次性邀请码换取 `sk-cp-…` API Key。                 |
-| `GET`   | `/healthz`                                    | —                   | 健康检查。                                            |
-| `GET`   | `/admin/login`                                | —                   | 登录页。                                              |
-| `POST`  | `/admin/login`                                | 表单（`token`）     | 写入 `cliproxy_admin` Cookie。                         |
-| `POST`  | `/admin/logout`                               | Cookie              | 退出登录。                                            |
-| `GET`   | `/admin/users` `/invites` `/stats` `/settings` | Cookie 或 Bearer   | 控制台页面。                                          |
-| `POST`  | `/admin/api/invites`                          | Cookie 或 Bearer    | 创建邀请码 `{label, ttl_hours}`。                      |
-| `POST`  | `/admin/api/invites/{hash}/delete`            | Cookie 或 Bearer    | 删除未兑换的邀请码。                                  |
-| `POST`  | `/admin/api/users/{id}/{enable,disable}`      | Cookie 或 Bearer    | 启用/停用用户。                                       |
-| `POST`  | `/admin/api/users/{id}/policy`                | Cookie 或 Bearer    | 设置用户策略。                                        |
-| `POST`  | `/admin/api/keys/issue`                       | Cookie 或 Bearer    | 为已存在的用户签发新 Key。                            |
-| `POST`  | `/admin/api/keys/{id}/revoke`                 | Cookie 或 Bearer    | 吊销 Key。                                            |
-| `POST`  | `/admin/api/settings/disabled-models`         | Cookie 或 Bearer    | 设置全局禁用模型列表（JSON `{"models":[...]}`）。     |
-| `POST`  | `/admin/api/settings/refresh-models`          | Cookie 或 Bearer    | 立即重新拉取上游模型清单。                            |
-| `GET`   | `/admin/api/stats?days=N`                     | Cookie 或 Bearer    | 最近 `N` 天的用量聚合。                               |
-| `GET`   | `/admin/api/usage`                            | Cookie 或 Bearer    | 可搜索的用量事件。Query：`q`（模糊匹配 user/model/error）、`user_id`、`model`、`status`（`ok`/`error`/`4xx`/`5xx`/字面码）、`since`/`until`（`YYYY-MM-DDTHH:MM`）、`min_tokens`、`only_error`、`sort`（`time_desc`/`time_asc`/`tokens_desc`/`tokens_asc`/`latency_desc`/`latency_asc`）、`page`、`page_size`。 |
+- **OAuth 登录**：界面（或 `ccm-server admin account login`）打开 Claude 授权页，同意后页面显示
+  `code#state`，粘贴回来即可。如果把 `upstream.oauth_redirect_uri` 设为
+  `http://<主机>:8787/oauth/callback`（且 client id 允许），登录会自动完成。
+- **导入**：任意常见格式的 `.credentials.json`，或它们组成的 JSON 数组（元素可以是
+  `{"label","account_group","credentials"}`）。邮箱相同的账号会更新而不是重复添加，重新登录也靠这个
+  清除"需重新登录"状态。
+- **单个账号**：标签、优先级、权重、分组、代理、启用 / 禁用、置顶、立即刷新、解除冷却、删除。
+  配了代理的账号所有请求都只走代理，不会回落直连。
 
-`/v1/messages` 的所有错误都按 Anthropic 标准结构返回：
+## 调度与故障切换
 
-```json
-{ "type": "error", "error": { "type": "...", "message": "..." } }
-```
+每个请求只在以下账号里选：启用、属于该终端的账号组（策略里的 `account_group`，不设则全部）、
+状态正常、不在冷却中。其中优先用额度低于 `pool.quota_soft_limit` 的；会话之前绑定的账号仍健康就继续用
+（会话取 Claude Code 的 `metadata.user_id`，没有则按终端 Key）；否则按 `pool.strategy` 选。
 
-未经修改的 `claude` 客户端因此能正常解析。
+在给客户端写出任何字节之前，失败会换下一个账号（最多再试 `pool.max_retries` 个）：
 
-## Effort dry-run CLI
+| 上游结果                            | 处理                                                          |
+| ----------------------------------- | ------------------------------------------------------------- |
+| 429                                 | 冷却到 `retry-after` / `anthropic-ratelimit-*-reset`（没有则 `pool.cooldown_secs`） |
+| 401                                 | 强制刷新 token（没有 refresh token 则标记需重新登录）          |
+| 403                                 | 冷却 30 分钟                                                  |
+| 500 / 502 / 503 / 504 / 529、网络错误 | 直接换下一个，不冷却                                         |
+| 其他                                | 原样返回                                                      |
 
-`cliproxy effort` 可以本地预览 effort 分级展开，不需要起服务。它直接调用代
-理运行时同一份 `applyEffort` 逻辑去吃当前配置里的 `effort_levels`。
+账号试完时把最后一次上游响应原样返回；所有可用账号都在冷却时直接返回 429 和 `retry-after`，
+不再请求上游。冷却时间存在数据库里，重启不丢。
 
-```sh
-# 看当前配置定义了哪些档
-cliproxy effort list
+**额度**：每次上游响应的 `anthropic-ratelimit-unified-5h/7d-*` 响应头都会更新该账号的额度快照，
+在界面、托盘和 `/metrics` 里显示。设置 `upstream.usage_url` 可以额外定时主动查询。
 
-# 预览单个档位展开成的字段
-cliproxy effort expand --tier high
+## OpenAI 兼容
 
-# 预览整个 body 改写后的样子
-cliproxy effort expand --body '{"model":"claude-opus-4-7","effort":"max","messages":[]}'
+`POST /v1/chat/completions` 与 Messages 双向转换：system / developer 消息、文本和图片
+（data URL 或 http URL）、tools 与 `tool_choice`、assistant 的 `tool_calls` 和 `tool` 结果、`stop`、
+`max_completion_tokens`、`reasoning_effort`（映射到 effort 档位）、`stream` 与
+`stream_options.include_usage`。响应包含 `tool_calls`、`reasoning_content` 和 usage。
+用模型路由把 OpenAI 模型名映射过来，例如 `re:^gpt-4` → `claude-sonnet-4-5`。
 
-# 也支持从 stdin 接收 body
-echo '{"model":"x","effort":"medium"}' | cliproxy effort expand
-```
+## 接口与命令行
 
-## 命令行管理
-
-大部分管理子命令是对管理 API 的薄封装，需要先设置 `CLIPROXY_ADMIN_TOKEN`
-（如果代理不在 `127.0.0.1:8787`，再设置 `CLIPROXY_ADMIN_URL`）：
+完整接口表和命令行用法见 [README.md](./README.md#http-api)。常用命令：
 
 ```sh
-cliproxy admin invite create --label alice --ttl-hours 24
-cliproxy admin user disable 3
-cliproxy admin user enable 3
-cliproxy admin key revoke 7
+ccm-server admin account login --label 我的 Max
+ccm-server admin account import --file ~/.claude/.credentials.json
+ccm-server admin account set 2 --priority 10 --group team --proxy socks5://127.0.0.1:1080
+ccm-server admin invite create --label alice --ttl-hours 24
+ccm-server admin user policy 3 --rpm 10 --daily-tokens 2000000 --group team
+ccm-server admin models routes 're:^gpt-4=claude-sonnet-4-5'
+ccm-server admin key issue 3 --ttl-days 30        # 30 天后过期；renew 7 --days 90 续期
+ccm-server admin settings '{"pool":{"strategy":"least_used"}}'   # 运行时修改设置
+ccm-server admin monitor on                       # 开启请求录制
+ccm-server admin claude-code sync --base-url http://127.0.0.1:8787
+ccm-server admin security deny 203.0.113.0/24 --hours 24
+ccm-server admin tunnel install && ccm-server admin tunnel start   # 公网访问（快速隧道）
+ccm-server admin reset-token                      # 忘了管理员令牌时，直接写本地数据库
+ccm-server migrate-from-go --go-data-dir ~/.local/share/cliproxy
 ```
 
-唯一例外是 **`cliproxy admin reset-token`**：它直接写本地 SQLite 数据库，不
-经过 HTTP，所以 **必须在服务停掉之后** 再执行。
+## 运行说明
 
-## 找回管理员 Token
+- **effort 档位**：请求体顶层的 `"effort"` 会补上 `max_tokens` 和 extended thinking
+  （auto 8192 · low 4096 · medium 16384+5000 · high 32768+15000 · xhigh 48000+30000 · max 64000+60000）；
+  请求里已有的值优先；未知档位返回 400。
+- **system 注入**：OAuth Pro/Max 接口要求第一个 system 块是
+  `You are Claude Code, Anthropic's official CLI for Claude.`，否则返回误导性的 `rate_limit_error`。
+  缺少时自动补上，可用 `upstream.inject_claude_code_system` 关闭。
+- **上游错误**：状态码、响应头和响应体原样转发，错误摘要（含 `request_id`）写日志并记入用量。
+- **监控**：`/metrics` 按账号和状态码给出请求数、token 计数、账号可用 / 冷却和额度利用率，
+  用管理员令牌作为 Bearer 抓取。
+- **备份**：备份 `data_dir`（`cc-manager.db` + `secret.key`）。
 
-cliproxy 首次启动时会把 admin token 输出到 stdout，**仅此一次**。如果丢失了，
-所有 `/admin/*` 路由都会跳到 `/admin/login?next=…`，无法登录。两种恢复方式：
-
-**方式 1：用 CLI 重置**
+## 开发
 
 ```sh
-# 先停掉服务
-./cliproxy --config ./config.yaml admin reset-token
-# 也可以指定具体值
-./cliproxy --config ./config.yaml admin reset-token --token my-new-secret
-# 重新启动
-./cliproxy --config ./config.yaml serve
+pnpm install && pnpm build          # 网页界面（编译 ccm-server 时内嵌）
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo run -p ccm-server -- serve    # 无界面
+pnpm tauri dev                      # 桌面端；`pnpm tauri build` 打安装包
 ```
 
-**方式 2：在配置文件中固定**
-
-把 `admin.initial_token` 写进 `config.yaml`（或设置 `CLIPROXY_ADMIN_TOKEN`
-环境变量）。每次启动都会按这个值安装 token，只要保住配置文件就不会被锁在
-门外：
-
-```yaml
-admin:
-  initial_token: "your-long-random-string"
-```
-
-## 运维提示
-
-- **把 cliproxy 当 `claude` 的后端使用**：未经修改的 Claude Code CLI 可以
-  直接指过来（`ANTHROPIC_BASE_URL=http://proxy.lan:8787`），关键点：
-  - `GET /v1/models` 由 cliproxy 自己回（取自定时刷新的 catalog 缓存），
-    `claude` 启动探测模型时无需再绕一次 `api.anthropic.com`。
-  - 入站 `anthropic-beta` 与配置默认值**合并**去重后再发上游，所以
-    `claude` 自带的 `interleaved-thinking-…`、
-    `fine-grained-tool-streaming-…` 等 feature flag 会和必需的
-    `claude-code-…,oauth-…` 一起到达 Anthropic。
-  - 入站 `User-Agent` 仅在以 `claude-cli/`、`claude-code/`、`anthropic-`
-    或 `claude/` 开头时透传；裸 `curl/8.x`、第三方 SDK 等会被替换为配置
-    默认 UA，避免触发 Anthropic 反滥用层、同时保留真正 Claude Code 流量
-    在日志里的可识别性。
-
-- **OpenAI 风格的 effort 分级**：`/v1/messages` 支持额外的顶层
-  `"effort"` 字段，作为 Anthropic 的 `max_tokens` + 扩展思考
-  `budget_tokens` 的别名。内置分级（可在 `upstream.effort_levels` 调整）：
-
-  | tier   | max_tokens | thinking budget |
-  | ------ | ---------- | --------------- |
-  | auto   | 8192       | —               |
-  | low    | 4096       | —               |
-  | medium | 16384      | 5000            |
-  | high   | 32768      | 15000           |
-  | xhigh  | 48000      | 30000           |
-  | max    | 64000      | 60000           |
-
-  cliproxy 会在转发前剥掉 `effort` 字段（Anthropic 不识别它）。请求中已经
-  显式设置的 `max_tokens` 或 `thinking` 永远优先 —— `effort` 只补默认值。
-  未知 tier 返回 400 并列出可用值。
-
-- **System prompt 自动注入**：Anthropic 的 OAuth Pro/Max 端点要求每次
-  `/v1/messages` 请求的第一段 `system` 必须是字面串
-  `You are Claude Code, Anthropic's official CLI for Claude.`。如果请求里
-  没有（比如裸 curl、第三方 SDK），Anthropic 会返回*完全相同*的 terse
-  `rate_limit_error: "Error"` —— 跟真的速率限制一模一样，常被误判。默认
-  cliproxy 会在转发前把这段补到 `system` 数组的最前面，原有的 system 内容
-  保留在它之后。已经以这段开头的请求（如直接来自 `claude` 本身）按字节透传，
-  不会双写。要关掉这个行为，配置 `upstream.inject_claude_code_system: false`。
-- **上游错误可见性**：代理会把 Anthropic 的状态码与响应体 1:1 转发，包括
-  `{"type":"error","error":{...},"request_id":"..."}` 以及 `retry-after`
-  / `anthropic-ratelimit-*` 头，所以未经修改的 `claude` 客户端能正常感知。
-  任何 4xx/5xx，服务端日志都会打出结构化的一行（status、err_type、
-  request_id、retry-after、命中的用户），同样的摘要也会写入
-  `usage_events.error` 列。Anthropic 的 OAuth bearer 速率限制常常返回非常
-  简短的 `"message":"Error"` —— 这是 Anthropic 自己的格式，不是 cliproxy
-  改的，找官方支持时 request_id 是唯一可对账的线索。
-- **模型清单**：cliproxy 启动时（之后每 30 分钟一次）会用主机的 OAuth token
-  调用 Anthropic `GET /v1/models`，自动发现当前 Pro/Max 套餐能用的模型。
-  Settings 页把这份清单渲染成复选框，勾选的模型会被加入全局禁用列表。如果
-  之前被禁用的某个模型在最新清单中消失（Anthropic 调整了套餐，或重命名了
-  模型 ID），后台会把它放进「Previously selected, no longer available」分
-  区里突出显示，避免被静默忽略。点击「Refresh catalog」按钮，或调用
-  `POST /admin/api/settings/refresh-models` 即可手动刷新。
-- **进程托管**：用 systemd / supervisord 之类托起 cliproxy，发送 `SIGTERM`
-  即可优雅关停。
-- **OAuth 刷新**：access token 离过期不到 60 秒时会在进程内刷新，新的 access
-  / refresh token 会以原子方式写回 Claude Code 使用的同一个凭据文件，主机
-  CLI 自身依然处于登录态。
-- **数据备份**：`data_dir/cliproxy.db` 保存了所有用户、Key 哈希、策略与历史
-  用量。开启了 WAL 模式，备份建议用
-  `sqlite3 cliproxy.db ".backup '/path/to/copy.db'"`，不要直接 cp。
-- **TLS**：cliproxy 只跑 HTTP。生产环境请用 Caddy / nginx 终结 TLS，并把
-  cliproxy 绑到 `127.0.0.1`。
-- **重置一切**：停服 → 删除 `data_dir/cliproxy.db` → 重启即可重新初始化。
-
-## 客户端常用接入方式
-
-任何尊重 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_API_KEY` 的 Claude SDK / 工具都
-可以直接对接。例：
-
-```sh
-# Claude Code CLI
-export ANTHROPIC_BASE_URL=http://proxy.lan:8787
-export ANTHROPIC_API_KEY=sk-cp-...
-claude
-
-# 直接 curl
-curl http://proxy.lan:8787/v1/messages \
-  -H "x-api-key: sk-cp-..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-5",
-    "max_tokens": 256,
-    "messages": [{"role":"user","content":"你好"}]
-  }'
-```
-
-## 已知约束
-
-- **Anthropic 服务条款**：把 Pro/Max 会话分给多人使用可能违反你订阅的条款，
-  请自行评估合规风险。
-- **默认无 TLS**：在真实网络中务必走 Caddy/nginx 终结 TLS。
-- **OAuth 端点不属于公开 API**：refresh URL、`oauth_client_id`、
-  `anthropic-beta` 这些值不是 Anthropic 官方公开文档。一旦上游变更，请在配
-  置文件里直接覆盖默认值。
+Linux 编译桌面端需要 `libwebkit2gtk-4.1-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`。
+推送 `v*` 标签会触发发布流水线：三平台安装包、`ccm-server` 二进制、`ghcr.io` 镜像，生成草稿 Release。

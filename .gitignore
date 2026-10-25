@@ -1,9 +1,12 @@
-/cliproxy
 /dist/
 /data/
 *.db
 *.db-wal
 *.db-shm
 .env
-config.yaml
-!config.example.yaml
+/target/
+/node_modules/
+/src-tauri/gen/
+/src-tauri/target/
+config.json
+*.tsbuildinfo

@@ -1,0 +1,22 @@
+# docker compose up -d   →   http://localhost:8787 (admin token in `docker compose logs`)
+services:
+  cc-manager:
+    build: .
+    image: cc-manager:latest
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ccm-data:/data
+      # Optional: seed account #1 from a Claude Code login on the host. The
+      # file is re-written on token refresh, so it must not be read-only.
+      # - ~/.claude/.credentials.json:/data/claude-credentials.json
+    environment:
+      # CCM_ADMIN_TOKEN: change-me           # fixed admin token (else printed once)
+      # CCM_SECRET_KEY: <base64 32 bytes>    # else /data/secret.key is created
+      # CCM_CREDENTIALS_PATH: /data/claude-credentials.json
+      # CCM_POOL_STRATEGY: round_robin
+      RUST_LOG: info
+
+volumes:
+  ccm-data:
