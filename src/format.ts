@@ -33,3 +33,25 @@ export function fmtPct(v: number | null | undefined): string {
   if (v === null || v === undefined) return "—";
   return `${Math.round(v * 100)}%`;
 }
+
+/// Compact countdown like the reset timers: "45s", "18m", "1h 18m", "6d 15h".
+export function fmtCountdown(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m`;
+  return `${s}s`;
+}
+
+export function fmtDate(ts: number | null | undefined): string {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+export function fmtClock(ts: number | null | undefined): string {
+  if (!ts) return "";
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}

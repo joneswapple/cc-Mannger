@@ -1,34 +1,52 @@
+import { LogOut, Monitor, Moon, Sun } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ApiError, get, getToken, isTauri, setToken } from "./api";
+import { LangProvider, useI18n } from "./i18n";
 import Accounts from "./pages/Accounts";
 import Connect from "./pages/Connect";
 import Dashboard from "./pages/Dashboard";
-import Invites from "./pages/Invites";
 import Settings from "./pages/Settings";
+import Terminals from "./pages/Terminals";
 import Usage from "./pages/Usage";
-import Users from "./pages/Users";
+import { useTheme } from "./theme";
+import { ToastProvider } from "./toast";
 import { Button, ErrorBox, inputClass } from "./ui";
 
 const PAGES = {
-  dashboard: { label: "概览", component: Dashboard },
-  accounts: { label: "上游账号", component: Accounts },
-  users: { label: "终端", component: Users },
-  invites: { label: "邀请码", component: Invites },
-  usage: { label: "用量", component: Usage },
-  settings: { label: "设置", component: Settings },
-  connect: { label: "接入", component: Connect },
+  dashboard: Dashboard,
+  accounts: Accounts,
+  terminals: Terminals,
+  usage: Usage,
+  settings: Settings,
+  connect: Connect,
 } as const;
 
-type PageKey = keyof typeof PAGES;
+export type PageKey = keyof typeof PAGES;
 
-function initialPage(): PageKey {
-  const h = location.hash.replace("#", "");
+function pageFromHash(): PageKey {
+  const h = location.hash.replace("#", "").split("?")[0];
   return h in PAGES ? (h as PageKey) : "dashboard";
 }
 
+export function navigate(page: PageKey) {
+  location.hash = page;
+}
+
 export default function App() {
+  return (
+    <LangProvider>
+      <ToastProvider>
+        <Shell />
+      </ToastProvider>
+    </LangProvider>
+  );
+}
+
+function Shell() {
   const [authed, setAuthed] = useState<boolean | null>(isTauri ? true : null);
-  const [page, setPage] = useState<PageKey>(initialPage);
+  const [page, setPage] = useState<PageKey>(pageFromHash);
+  const { t, toggle } = useI18n();
+  const theme = useTheme();
 
   useEffect(() => {
     if (isTauri) return;
@@ -42,7 +60,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const onHash = () => setPage(initialPage());
+    const onHash = () => setPage(pageFromHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -50,36 +68,57 @@ export default function App() {
   if (authed === null) return null;
   if (!authed) return <Login onLogin={() => setAuthed(true)} />;
 
-  const Page = PAGES[page].component;
+  const Page = PAGES[page];
+  const ThemeIcon = theme.pref === "light" ? Sun : theme.pref === "dark" ? Moon : Monitor;
+  const roundBtn =
+    "inline-flex h-10 w-10 items-center justify-center rounded-full bg-white text-sm font-semibold text-slate-600 shadow-sm ring-1 ring-slate-200 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-300 dark:ring-slate-800 dark:hover:bg-slate-800";
   return (
-    <div className="flex min-h-screen flex-col md:flex-row">
-      <nav className="flex shrink-0 gap-1 overflow-x-auto border-b border-slate-200 bg-white p-2 md:w-48 md:flex-col md:border-b-0 md:border-r dark:border-slate-800 dark:bg-slate-900">
-        <div className="hidden px-2 py-3 text-lg font-semibold md:block">CC Manager</div>
-        {(Object.keys(PAGES) as PageKey[]).map((k) => (
-          <a
-            key={k}
-            href={`#${k}`}
-            className={`whitespace-nowrap rounded-md px-3 py-2 text-sm ${
-              page === k ? "bg-orange-100 font-medium text-orange-900 dark:bg-orange-950 dark:text-orange-200" : "hover:bg-slate-100 dark:hover:bg-slate-800"
-            }`}
-          >
-            {PAGES[k].label}
+    <div className="min-h-screen">
+      <header className="sticky top-0 z-40 border-b border-slate-200/60 bg-slate-100/80 backdrop-blur dark:border-slate-800/60 dark:bg-slate-950/80">
+        <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3 md:px-6">
+          <a href="#dashboard" className="flex shrink-0 items-center gap-2">
+            <img src="/icon.png" alt="" className="h-8 w-8 rounded-lg" onError={(e) => (e.currentTarget.style.display = "none")} />
+            <span className="hidden text-lg font-bold tracking-tight sm:inline">CC Manager</span>
           </a>
-        ))}
-        {!isTauri && (
-          <button
-            className="mt-auto whitespace-nowrap rounded-md px-3 py-2 text-left text-sm text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-            onClick={() => {
-              setToken("");
-              setAuthed(false);
-            }}
-          >
-            退出登录
-          </button>
-        )}
-      </nav>
-      <main className="min-w-0 flex-1 p-4 md:p-6">
-        <h1 className="mb-4 text-xl font-semibold">{PAGES[page].label}</h1>
+          <nav className="mx-auto flex min-w-0 overflow-x-auto rounded-full bg-white p-1 shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
+            {(Object.keys(PAGES) as PageKey[]).map((k) => (
+              <a
+                key={k}
+                href={`#${k}`}
+                className={`whitespace-nowrap rounded-full px-4 py-1.5 text-sm transition-colors ${
+                  page === k
+                    ? "bg-slate-900 font-medium text-white dark:bg-white dark:text-slate-900"
+                    : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+                }`}
+              >
+                {t(`nav.${k}`)}
+              </a>
+            ))}
+          </nav>
+          <div className="flex shrink-0 items-center gap-2">
+            <button className={roundBtn} onClick={theme.next} title={t(`nav.theme_${theme.pref}`)} aria-label={t(`nav.theme_${theme.pref}`)}>
+              <ThemeIcon className="h-4 w-4" />
+            </button>
+            <button className={roundBtn} onClick={toggle} title="Language">
+              {t("nav.lang")}
+            </button>
+            {!isTauri && (
+              <button
+                className={roundBtn}
+                title={t("nav.logout")}
+                aria-label={t("nav.logout")}
+                onClick={() => {
+                  setToken("");
+                  setAuthed(false);
+                }}
+              >
+                <LogOut className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+      <main className="mx-auto max-w-7xl px-4 py-6 md:px-6">
         <Page />
       </main>
     </div>
@@ -87,13 +126,14 @@ export default function App() {
 }
 
 function Login({ onLogin }: { onLogin: () => void }) {
+  const { t } = useI18n();
   const [token, setTokenInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   return (
     <div className="flex min-h-screen items-center justify-center p-4">
       <form
-        className="w-full max-w-sm space-y-3 rounded-lg border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900"
+        className="w-full max-w-sm space-y-4 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900"
         onSubmit={async (e) => {
           e.preventDefault();
           setBusy(true);
@@ -103,20 +143,18 @@ function Login({ onLogin }: { onLogin: () => void }) {
             onLogin();
           } catch (err) {
             setToken("");
-            setError(err instanceof ApiError && err.status === 401 ? "管理员令牌不正确" : String(err));
+            setError(err instanceof ApiError && err.status === 401 ? t("login.wrong") : String(err));
           } finally {
             setBusy(false);
           }
         }}
       >
-        <h1 className="text-lg font-semibold">CC Manager</h1>
-        <p className="text-sm text-slate-500">
-          输入管理员令牌（首次启动 <code>ccm-server</code> 时打印；忘了可以运行 <code>ccm-server admin reset-token</code>）。
-        </p>
+        <h1 className="text-xl font-bold">{t("login.title")}</h1>
+        <p className="text-sm text-slate-500">{t("login.hint")}</p>
         <ErrorBox error={error} />
         <input className={`${inputClass} font-mono`} type="password" value={token} onChange={(e) => setTokenInput(e.target.value)} autoFocus />
         <Button tone="primary" type="submit" disabled={busy || !token.trim()} className="w-full">
-          登录
+          {t("login.submit")}
         </Button>
       </form>
     </div>

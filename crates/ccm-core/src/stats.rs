@@ -112,7 +112,9 @@ impl Recorder {
         let conn = self.store.conn();
         let mut stmt = conn.prepare(
             "SELECT date(ts, 'unixepoch') AS d, COUNT(*),
-                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(status >= 400), 0), COALESCE(AVG(latency_ms), 0)
              FROM usage_events WHERE ts >= ?1 GROUP BY d ORDER BY d",
         )?;
         let rows = stmt.query_map([since(days)], |r| {
@@ -121,6 +123,9 @@ impl Recorder {
                 requests: r.get(1)?,
                 input_tokens: r.get(2)?,
                 output_tokens: r.get(3)?,
+                cache_read_tokens: r.get(4)?,
+                errors: r.get(5)?,
+                avg_latency_ms: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -396,6 +401,10 @@ pub struct DailySummary {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// Requests that ended with status >= 400.
+    pub errors: i64,
+    pub avg_latency_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -25,6 +25,7 @@ export interface Account {
   sync_file: boolean;
   cooldown_until: number;
   account_group: string;
+  last_used_at: number;
   created_at: number;
   updated_at: number;
   quota?: Quota | null;
@@ -43,6 +44,7 @@ export interface AccountsResponse {
   accounts: Account[];
   now: number;
   pool: PoolConfig;
+  recommended: number | null;
 }
 
 export interface Policy {
@@ -94,7 +96,7 @@ export interface Rollup {
 
 export interface Stats {
   days: number;
-  by_day: (Rollup & { date: string })[];
+  by_day: (Rollup & { date: string; cache_read_tokens: number; errors: number; avg_latency_ms: number })[];
   by_user: (Rollup & { user_id: number; label: string })[];
   by_model: (Rollup & { model: string })[];
   by_account: (Rollup & { account_id: number; label: string })[];

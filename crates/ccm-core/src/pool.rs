@@ -273,6 +273,15 @@ impl AccountPool {
             .remove(&id);
     }
 
+    /// Drops every sticky session binding, so the next request of each
+    /// session is scheduled afresh (after a manual switch / pin).
+    pub fn clear_sticky(&self) {
+        self.sticky
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// Parks an account for `secs` seconds (capped at a day).
     pub fn cool_down(&self, id: i64, secs: i64, reason: &str) {
         let secs = secs.clamp(1, 86_400);
@@ -456,6 +465,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pick(&p, &sess("s1")), moved);
+    }
+
+    #[test]
+    fn clear_sticky_lets_a_pin_take_effect() {
+        let s = test_store();
+        let a = add(&s, "a", 5, 1, "");
+        let b = add(&s, "b", 0, 1, "");
+        let p = pool(&s, Strategy::Priority, true);
+        let sess = PickRequest {
+            sticky_key: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(pick(&p, &sess), a);
+        s.pin(b).unwrap();
+        assert_eq!(pick(&p, &sess), a, "binding survives the priority change");
+        p.clear_sticky();
+        assert_eq!(pick(&p, &sess), b);
     }
 
     #[test]

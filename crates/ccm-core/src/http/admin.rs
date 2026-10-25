@@ -35,6 +35,7 @@ pub(super) fn routes() -> Router<Core> {
         .route("/accounts/oauth/start", post(oauth_start))
         .route("/accounts/oauth/complete", post(oauth_complete))
         .route("/accounts/import", post(import_accounts))
+        .route("/accounts/export", get(export_accounts))
         .route("/accounts/:id", post(update_account))
         .route("/accounts/:id/refresh", post(refresh_account))
         .route("/accounts/:id/pin", post(pin_account))
@@ -345,6 +346,41 @@ async fn import_accounts(
         .into_response())
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ExportQuery {
+    /// Comma-separated account ids; empty exports every account.
+    ids: String,
+}
+
+/// The one endpoint that returns token material: a batch in the format
+/// `/accounts/import` accepts, for backup or moving accounts elsewhere.
+async fn export_accounts(
+    _: AdminAuth,
+    State(core): State<Core>,
+    Query(q): Query<ExportQuery>,
+) -> ApiResult {
+    let wanted: Vec<i64> = q
+        .ids
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let mut out = vec![];
+    for a in core.accounts.list().map_err(internal)? {
+        if !wanted.is_empty() && !wanted.contains(&a.id) {
+            continue;
+        }
+        let creds = core.accounts.load_credentials(a.id).map_err(internal)?;
+        out.push(json!({
+            "label": a.label,
+            "account_group": a.account_group,
+            "credentials": {"claudeAiOauth": creds},
+        }));
+    }
+    tracing::info!("exported {} account(s) with credentials", out.len());
+    Ok(Json(out).into_response())
+}
+
 async fn refresh_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<i64>) -> ApiResult {
     core.refresh_account(id)
         .await
@@ -353,10 +389,10 @@ async fn refresh_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<
 }
 
 async fn pin_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<i64>) -> ApiResult {
-    core.accounts
-        .pin(id)
-        .map(|a| Json(a).into_response())
-        .map_err(account_error)
+    let a = core.accounts.pin(id).map_err(account_error)?;
+    // A pin is a manual switch: move bound sessions over too.
+    core.pool.clear_sticky();
+    Ok(Json(a).into_response())
 }
 
 async fn delete_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<i64>) -> ApiResult {

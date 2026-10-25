@@ -130,11 +130,16 @@ impl Upstream {
             );
             let error = match verdict {
                 Verdict::Done => {
+                    if status < 400 {
+                        if let Err(e) = self.pool.store().mark_used(account_id) {
+                            tracing::warn!(account = account_id, "mark used: {e:#}");
+                        }
+                    }
                     return Ok(Forwarded {
                         resp,
                         account_id,
                         failed,
-                    })
+                    });
                 }
                 Verdict::Retry {
                     cooldown: Some(secs),

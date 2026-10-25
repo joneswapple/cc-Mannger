@@ -172,6 +172,12 @@ pub enum AccountCommand {
         #[arg(long, default_value = "")]
         group: String,
     },
+    /// Print accounts with their tokens as JSON (importable with
+    /// `account import --file`). Handle the output as a secret.
+    Export {
+        /// Account ids; none exports all.
+        ids: Vec<i64>,
+    },
     /// Refresh the account's token now and re-read its profile.
     Refresh {
         id: i64,
@@ -342,6 +348,11 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 json!({"credentials": credentials, "label": label, "account_group": group}),
             )
             .await?
+        }
+        AdminCommand::Account(AccountCommand::Export { ids }) => {
+            let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+            c.get_query("/admin/api/accounts/export", &[("ids", ids.join(","))])
+                .await?
         }
         AdminCommand::Account(AccountCommand::Refresh { id }) => {
             c.post(&format!("/admin/api/accounts/{id}/refresh"), Value::Null)

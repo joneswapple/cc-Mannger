@@ -247,8 +247,10 @@ fn on_menu(app: &AppHandle, id: &str) {
                 .strip_prefix("pin:")
                 .and_then(|s| s.parse::<i64>().ok())
             {
-                if let Err(e) = app.state::<Core>().accounts.pin(id) {
-                    tracing::warn!("pin account {id}: {e:#}");
+                let core = app.state::<Core>();
+                match core.accounts.pin(id) {
+                    Ok(_) => core.pool.clear_sticky(),
+                    Err(e) => tracing::warn!("pin account {id}: {e:#}"),
                 }
                 refresh_tray(app);
             }

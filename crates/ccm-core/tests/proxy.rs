@@ -1414,3 +1414,40 @@ async fn metrics_require_admin_and_report_counters() {
         text.contains(r#"ccm_account_up{account_id="1",account="claude-cli",status="active"} 1"#)
     );
 }
+
+#[tokio::test]
+async fn export_round_trips_through_import_and_tracks_last_used() {
+    let h = harness().await;
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert!(h.core.accounts.get(1).unwrap().last_used_at > 0);
+
+    let (status, out) = h
+        .admin("GET", "/admin/api/accounts/export?ids=1", None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(out.as_array().unwrap().len(), 1);
+    assert_eq!(
+        out[0]["credentials"]["claudeAiOauth"]["accessToken"],
+        "upstream-access"
+    );
+    assert_eq!(
+        h.call(
+            Request::get("/admin/api/accounts/export")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .0,
+        401
+    );
+    let (status, r) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/import",
+            Some(json!({"credentials": out})),
+        )
+        .await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["imported"].as_array().unwrap().len(), 1);
+}

@@ -17,6 +17,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     ("003_pool", include_str!("../migrations/003_pool.sql")),
     ("004_quota", include_str!("../migrations/004_quota.sql")),
+    (
+        "005_last_used",
+        include_str!("../migrations/005_last_used.sql"),
+    ),
 ];
 
 pub const DB_FILE: &str = "cc-manager.db";

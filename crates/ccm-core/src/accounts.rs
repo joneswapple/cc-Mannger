@@ -38,6 +38,8 @@ pub struct Account {
     /// Unix seconds until which the scheduler skips this account (0 = none).
     pub cooldown_until: i64,
     pub account_group: String,
+    /// Last successful upstream request (unix seconds, 0 = never).
+    pub last_used_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -88,7 +90,8 @@ pub struct AccountStore {
 }
 
 const COLS: &str = "id, label, email, org_uuid, plan, priority, weight, enabled, status, \
-    status_reason, proxy_url, source_path, sync_file, cooldown_until, account_group, created_at, updated_at";
+    status_reason, proxy_url, source_path, sync_file, cooldown_until, account_group, last_used_at, \
+    created_at, updated_at";
 
 fn from_row(r: &Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
@@ -107,8 +110,9 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Account> {
         sync_file: r.get(12)?,
         cooldown_until: r.get(13)?,
         account_group: r.get(14)?,
-        created_at: r.get(15)?,
-        updated_at: r.get(16)?,
+        last_used_at: r.get(15)?,
+        created_at: r.get(16)?,
+        updated_at: r.get(17)?,
     })
 }
 
@@ -360,6 +364,15 @@ impl AccountStore {
             ],
         )?;
         self.get(id)
+    }
+
+    /// Records a successful request served by the account.
+    pub fn mark_used(&self, id: i64) -> Result<()> {
+        self.store.conn().execute(
+            "UPDATE accounts SET last_used_at = ?1 WHERE id = ?2",
+            params![crate::now_unix(), id],
+        )?;
+        Ok(())
     }
 
     /// The account already holding this email, if any (re-logins update it
