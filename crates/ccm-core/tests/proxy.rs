@@ -1383,3 +1383,34 @@ async fn models_list_has_openai_fields() {
     assert_eq!(v["data"][0]["owned_by"], "anthropic");
     assert_eq!(v["data"][0]["type"], "model");
 }
+
+#[tokio::test]
+async fn metrics_require_admin_and_report_counters() {
+    let h = harness().await;
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(
+        h.call(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .0,
+        401
+    );
+    let req = Request::get("/metrics")
+        .header("authorization", format!("Bearer {ADMIN}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, body) = h.call(req).await;
+    assert_eq!(status, 200);
+    assert!(hdr(&headers, "content-type").starts_with("text/plain"));
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains(r#"ccm_requests_total{account_id="1",account="claude-cli",status="200"} 1"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"ccm_tokens_total{account_id="1",account="claude-cli",kind="input"} 7"#)
+    );
+    assert!(
+        text.contains(r#"ccm_account_up{account_id="1",account="claude-cli",status="active"} 1"#)
+    );
+}

@@ -38,6 +38,17 @@ enum Msg {
 pub struct Recorder {
     store: Store,
     tx: SyncSender<Msg>,
+    counters: std::sync::Arc<std::sync::Mutex<Counters>>,
+}
+
+/// Monotonic totals since process start, for `/metrics`.
+#[derive(Debug, Clone, Default)]
+pub struct Counters {
+    /// (account id, HTTP status) → requests.
+    pub requests: std::collections::BTreeMap<(i64, u16), u64>,
+    /// account id → (input, output, cache read, cache creation) tokens.
+    pub tokens: std::collections::BTreeMap<i64, [u64; 4]>,
+    pub dropped: u64,
 }
 
 impl Recorder {
@@ -48,17 +59,45 @@ impl Recorder {
             .name("ccm-stats".into())
             .spawn(move || run(writer, rx))
             .expect("spawn stats writer");
-        Self { store, tx }
+        Self {
+            store,
+            tx,
+            counters: Default::default(),
+        }
     }
 
     pub fn record(&self, e: Event) {
+        {
+            let mut c = self.counters.lock().unwrap_or_else(|p| p.into_inner());
+            *c.requests.entry((e.account_id, e.status)).or_default() += 1;
+            let t = c.tokens.entry(e.account_id).or_default();
+            for (slot, v) in t.iter_mut().zip([
+                e.input_tokens,
+                e.output_tokens,
+                e.cache_read_tokens,
+                e.cache_creation_tokens,
+            ]) {
+                *slot += v.max(0) as u64;
+            }
+        }
         match self.tx.try_send(Msg::Event(e)) {
             Ok(()) => {}
             Err(TrySendError::Full(Msg::Event(e))) => {
+                self.counters
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .dropped += 1;
                 tracing::warn!(user = e.user_id, model = %e.model, "stats: drop event (queue full)")
             }
             Err(_) => tracing::warn!("stats: writer stopped"),
         }
+    }
+
+    pub fn counters(&self) -> Counters {
+        self.counters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Blocks until every event recorded so far is written.

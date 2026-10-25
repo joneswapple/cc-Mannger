@@ -55,6 +55,7 @@ pub fn router(core: Core) -> Router {
         .route("/register", post(admin::register))
         .route("/oauth/callback", get(admin::oauth_callback))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .nest("/admin/api", admin::routes())
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(log_requests))
@@ -145,6 +146,18 @@ pub async fn call_local(
             .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()))
     };
     Ok((status, value))
+}
+
+/// Prometheus metrics; needs the admin token (Bearer works for scrapers).
+async fn metrics(_: AdminAuth, axum::extract::State(core): axum::extract::State<Core>) -> Response {
+    match core.metrics() {
+        Ok(text) => (
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            text,
+        )
+            .into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
 }
 
 /// Liveness only; details live behind the admin API.

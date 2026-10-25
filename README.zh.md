@@ -1,221 +1,183 @@
 # CC Manager
 
 一个桌面程序（Tauri）加一个无界面服务端，让局域网里的多台终端共用你已登录的
-**Claude Pro/Max** 账号。你只需在主机上登录一次；CC Manager 会加密保存 OAuth
-token、按需刷新，并用它自己签发的终端 Key 转发 Anthropic Messages API 请求。
-参考 [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)，
+**Claude Pro/Max** 账号。CC Manager 加密保存各账号的 OAuth token、自动刷新、在账号之间
+调度和故障切换，并用它自己签发的终端 Key 转发 Anthropic Messages API 和 OpenAI
+Chat Completions 请求。参考 [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)，
 只针对 Claude。
 
 English: [README.md](./README.md) · 阶段计划：[docs/ROADMAP.zh.md](./docs/ROADMAP.zh.md)
 
-> **范围说明**：仅用于个人实现与测试，只接入你自己的 Claude OAuth 账号，
-> **不支持** Anthropic API Key 账号。Anthropic 消费者条款不允许共享或转售
-> Pro/Max 订阅。
+> **范围说明**：仅用于个人实现与测试，只接入你自己的 Claude OAuth 账号，**不支持**
+> Anthropic API Key 账号。Anthropic 消费者条款不允许共享或转售 Pro/Max 订阅。
 
 ## 功能
 
-- `POST /v1/messages`：兼容 Anthropic 的接口，SSE 流式透传。设置
-  `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` 后，原版 `claude` 直接可用。
-- 邀请码自助注册：每台终端用邀请码换一个自己的 `sk-cp-…` Key（bcrypt 哈希存储，只显示一次）。
-- 用户级策略：启用 / 禁用、模型白名单、每分钟请求数、每日 token 额度；另有全局禁用模型列表。
-- 每次请求记录用量（token、耗时、状态码、上游账号），可按天 / 用户 / 模型 / 账号汇总。
-- 上游账号存在 SQLite 中，token 用 AES-256-GCM 加密；首次启动自动导入主机上 Claude Code 的登录。
-- 多账号调度（优先级 / 加权轮询 / 最少使用）、保住 prompt cache 的粘性会话、
-  429 / 401 / 403 / 5xx 自动切换账号并冷却、账号分组。
-- 一套 Rust 核心，两种外壳：**桌面程序**（窗口 + 托盘，代理在程序内运行）和
-  **`ccm-server`**（无界面，适合服务器 / Docker）。
+- **代理**：`POST /v1/messages`（Anthropic，SSE 流式透传）和 `POST /v1/chat/completions`
+  （OpenAI 兼容，支持流式、工具调用、图片）。设置 `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY`
+  后原版 `claude` 直接可用。
+- **账号**：OAuth 登录（PKCE）；导入 Claude Code 凭据（文件、批量 JSON、macOS 钥匙串）；
+  首次启动自动导入本机登录；token 用 AES-256-GCM 加密；每个账号可单独配 HTTP/SOCKS5 出站代理。
+- **调度**：优先级 / 加权轮询 / 最少使用；粘性会话保住 prompt cache；429 / 401 / 403 / 5xx
+  自动切换账号并冷却；账号分组；按 5 小时 / 7 天额度用量避开快用完的账号。
+- **终端**：邀请码自助注册；`sk-cp-…` Key（bcrypt 存储、只显示一次）；终端策略（模型白名单、
+  每分钟请求数、每日 token、账号组）；全局禁用模型；模型路由（别名 / 正则）。
+- **管理**：React 网页界面（桌面窗口或浏览器）、JSON 接口、命令行、用量统计与搜索、Prometheus `/metrics`。
+- **桌面端**：托盘显示当前账号和额度、快速切换账号、启停代理；账号失效或全部限流时发系统通知。
+  安装包：NSIS（Windows）、AppImage / deb、dmg。
+- **无界面**：`ccm-server` 单个二进制（内嵌网页界面）、Docker 镜像、安装脚本。
 
-## 快速开始（无界面）
+## 快速开始
+
+### 桌面端
+
+从 [Releases](https://github.com/joneswapple/cc-Mannger/releases) 下载安装包（或自行编译，见"开发"）。
+首次启动会导入本机的 Claude Code 登录，并在 8787 端口启动代理。在「上游账号 → OAuth 登录」
+添加更多账号，在「终端」新建终端，在「接入」复制配置片段。
+
+### 无界面
 
 ```sh
-# 1. 编译
-cargo build --release -p ccm-server
+# 安装（Linux / macOS；Windows 用 scripts/install.ps1），或 cargo build --release -p ccm-server
+curl -fsSL https://raw.githubusercontent.com/joneswapple/cc-Mannger/main/scripts/install.sh | sh
 
-# 2. 确认主机上的 Claude Code 已登录（`claude /login`），
-#    凭据默认在 ~/.claude/.credentials.json
+ccm-server serve                     # 首次启动打印管理员令牌
+# 浏览器打开 http://<主机>:8787/ ，用管理员令牌登录
+```
 
-# 3. 启动。首次启动会打印管理员令牌，请立即保存
-./target/release/ccm-server serve        # 或：--config ./config.json
+也可以用 Docker：`docker compose up -d`（见 [docker-compose.yml](./docker-compose.yml)），
+管理员令牌在 `docker compose logs` 里。
 
-# 4. 创建邀请码（admin 子命令调用正在运行的服务）
-export CCM_ADMIN_TOKEN=<管理员令牌>
-./target/release/ccm-server admin invite create --label alice-laptop
+### 接入终端
 
-# 5. 在局域网终端上用邀请码换 Key
-curl -X POST http://<主机>:8787/register \
-     -H "Content-Type: application/json" \
+```sh
+# 用邀请码换 Key（邀请码在界面或 `ccm-server admin invite create` 创建）
+curl -X POST http://<主机>:8787/register -H "Content-Type: application/json" \
      -d '{"token":"<邀请码>","label":"alice"}'
 
-# 6. 让 Claude Code 走代理
 export ANTHROPIC_BASE_URL=http://<主机>:8787
 export ANTHROPIC_API_KEY=sk-cp-...
 claude
 ```
 
-## 桌面程序
-
-```sh
-pnpm install
-pnpm tauri dev      # 开发
-pnpm tauri build    # 打包：Windows NSIS、Linux AppImage/deb、macOS dmg
-```
-
-Linux 下编译需要 `libwebkit2gtk-4.1-dev`、`libayatana-appindicator3-dev`、
-`librsvg2-dev`。关闭窗口后代理继续在托盘里运行。桌面程序读取
-`<应用配置目录>/config.json`，与 `ccm-server` 共用同一个数据目录。
+OpenAI 客户端用 `base_url=http://<主机>:8787/v1`，Key 相同。
 
 ## 配置
 
 优先级：代码默认值 → `config.json` → `CCM_*` 环境变量。完整示例见
-[`config.example.json`](./config.example.json)。
+[`config.example.json`](./config.example.json)。桌面端读取 `<应用配置目录>/config.json`；
+`ccm-server` 用 `--config` / `CCM_CONFIG` 指定。
 
-| JSON 字段                         | 环境变量                         | 默认值                                         |
-| --------------------------------- | -------------------------------- | ---------------------------------------------- |
-| `listen`                          | `CCM_LISTEN`                     | `0.0.0.0:8787`                                 |
-| `data_dir`                        | `CCM_DATA_DIR`                   | `<系统数据目录>/cc-manager`                    |
-| `log_level`                       | `CCM_LOG_LEVEL`（或 `RUST_LOG`） | `info`                                         |
-| `secret_key`                      | `CCM_SECRET_KEY`                 | 空 → 使用 / 生成 `data_dir/secret.key`          |
-| `upstream.base_url`               | `CCM_UPSTREAM_BASE_URL`          | `https://api.anthropic.com`                    |
-| `upstream.credentials_path`       | `CCM_CREDENTIALS_PATH`           | 自动探测（见下文）                             |
-| `upstream.sync_credentials_file`  | `CCM_SYNC_CREDENTIALS_FILE`      | `true`                                         |
-| `upstream.oauth_token_url`        | —                                | `https://console.anthropic.com/v1/oauth/token` |
-| `upstream.oauth_client_id`        | —                                | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`         |
-| `upstream.anthropic_beta`         | —                                | `claude-code-20250219,oauth-2025-04-20`        |
-| `upstream.user_agent`             | —                                | `claude-cli/1.0 (cc-manager)`                  |
+| JSON 字段                            | 环境变量                      | 默认值                                         |
+| ------------------------------------ | ----------------------------- | ---------------------------------------------- |
+| `listen`                             | `CCM_LISTEN`                  | `0.0.0.0:8787`                                 |
+| `data_dir`                           | `CCM_DATA_DIR`                | `<系统数据目录>/cc-manager`                    |
+| `log_level`                          | `CCM_LOG_LEVEL` / `RUST_LOG`  | `info`                                         |
+| `secret_key`                         | `CCM_SECRET_KEY`              | 空 → 使用 / 生成 `data_dir/secret.key`          |
+| `admin.initial_token`                | `CCM_ADMIN_TOKEN`             | 空 → 首次启动随机生成并打印                    |
+| `upstream.base_url`                  | `CCM_UPSTREAM_BASE_URL`       | `https://api.anthropic.com`                    |
+| `upstream.credentials_path`          | `CCM_CREDENTIALS_PATH`        | 自动探测（见下文）                             |
+| `upstream.sync_credentials_file`     | `CCM_SYNC_CREDENTIALS_FILE`   | `true`                                         |
+| `upstream.oauth_*` / `profile_url`   | —                             | 与 Claude Code CLI 一致，见英文文档            |
+| `upstream.usage_url`                 | —                             | 空（不主动轮询，仍从响应头读取额度）           |
+| `upstream.usage_poll_secs`           | —                             | `600`                                          |
 | `upstream.inject_claude_code_system` | —                             | `true`                                         |
-| `upstream.effort_levels`          | —                                | 见"effort 档位"                                |
-| `pool.strategy`                   | `CCM_POOL_STRATEGY`              | `priority`（可选 `round_robin`、`least_used`） |
-| `pool.sticky`                     | `CCM_POOL_STICKY`                | `true`                                         |
-| `pool.sticky_ttl_secs`            | —                                | `3600`                                         |
-| `pool.max_retries`                | `CCM_POOL_MAX_RETRIES`           | `2`                                            |
-| `pool.cooldown_secs`              | —                                | `60`                                           |
-| `admin.initial_token`             | `CCM_ADMIN_TOKEN`                | 空 → 首次启动随机生成并打印                    |
+| `pool.strategy`                      | `CCM_POOL_STRATEGY`           | `priority`（可选 `round_robin`、`least_used`） |
+| `pool.sticky`                        | `CCM_POOL_STICKY`             | `true`                                         |
+| `pool.max_retries`                   | `CCM_POOL_MAX_RETRIES`        | `2`                                            |
+| `pool.cooldown_secs`                 | —                             | `60`                                           |
+| `pool.quota_soft_limit`              | —                             | `0.95`                                         |
+| `routing.background_model`           | —                             | 空（关闭）                                     |
+| `routing.background_max_tokens`      | —                             | `512`                                          |
 
-`ccm-server` 也接受 `--config` / `CCM_CONFIG` 指定配置文件路径。
+OAuth、profile、用量这些接口都没有公开文档，全部做成配置项，Anthropic 改了可以跟着调。
 
-**账号与加密密钥**：上游 token 用 `secret_key` 或 `data_dir/secret.key` 加密。
-请把这个密钥和 `cc-manager.db` 一起备份，丢了密钥就无法解密已保存的 token。
-还没有任何账号时，会把 Claude Code 凭据文件导入为账号 #1，查找顺序：
-`upstream.credentials_path` → `$CLAUDE_CREDENTIALS_PATH` →
-`$CLAUDE_CONFIG_DIR/.credentials.json` → `~/.claude/.credentials.json`。
-开启 `sync_credentials_file`（默认）时，这个文件始终以它为准（刷新前重读、刷新后回写），
-主机上的 `claude` 可以和 CC Manager 同时使用。macOS 需要先从钥匙串导出：
-`security find-generic-password -s "Claude Code-credentials" -w > ~/.claude/.credentials.json`。
+**加密密钥**：上游 token 用 `secret_key` 或 `data_dir/secret.key` 加密，请和 `cc-manager.db` 一起备份。
 
-## HTTP 接口
+**本机登录**：还没有任何账号时，按 `upstream.credentials_path` → `$CLAUDE_CREDENTIALS_PATH` →
+`$CLAUDE_CONFIG_DIR/.credentials.json` → `~/.claude/.credentials.json` 的顺序找到 Claude Code
+凭据并导入为账号 #1。开启 `sync_credentials_file`（默认）时以该文件为准，本机的 `claude` 可以同时使用。
+macOS 用 `ccm-server admin account import --from-keychain` 从钥匙串导入。
 
-管理接口里的时间都是 unix 秒。
+## 账号
 
-| 方法 | 路径                                      | 认证          | 说明                                                  |
-| ---- | ----------------------------------------- | ------------- | ----------------------------------------------------- |
-| `POST` | `/v1/messages`                          | `x-api-key`   | Anthropic Messages 接口（SSE + JSON）                 |
-| `POST` | `/v1/messages/count_tokens`             | `x-api-key`   | 计算 token，透传；不受策略限制、不计统计              |
-| `GET`  | `/v1/models`                            | `x-api-key`   | 从缓存的上游模型目录返回                              |
-| `POST` | `/register`                             | 邀请码（body）| `{token, label}` → `{api_key, user_id}`               |
-| `GET`  | `/healthz`                              | —             | 存活检查：`{status, version}`                         |
-| `GET`  | `/admin/api/status`                     | 管理员        | 版本、账号数、上游来源、模型目录状态                  |
-| `GET` `POST` | `/admin/api/users`                | 管理员        | 用户列表（含 Key 与策略，不含哈希）/ 创建用户         |
-| `POST` | `/admin/api/users/{id}/{enable,disable}` | 管理员       | 启用 / 禁用用户                                       |
-| `GET` `POST` | `/admin/api/users/{id}/policy`    | 管理员        | 读取 / 替换策略                                       |
-| `POST` | `/admin/api/keys/issue`                 | 管理员        | `{user_id}` → `{api_key, key_id}`                     |
-| `POST` | `/admin/api/keys/{id}/revoke`           | 管理员        | 吊销 Key                                              |
-| `GET` `POST` | `/admin/api/invites`              | 管理员        | 邀请码列表 / 创建                                     |
-| `POST` | `/admin/api/invites/{hash}/delete`      | 管理员        | 删除未使用的邀请码                                    |
-| `GET`  | `/admin/api/accounts`                   | 管理员        | 上游账号（只有元数据，绝不返回 token）、调度配置、`now` |
-| `POST` | `/admin/api/accounts/{id}`              | 管理员        | 修改 `{label, priority, weight, enabled, account_group, clear_cooldown}` |
-| `GET`  | `/admin/api/settings`                   | 管理员        | 禁用模型、模型目录、上游请求参数                      |
-| `POST` | `/admin/api/settings/disabled-models`   | 管理员        | 替换全局禁用模型列表                                  |
-| `POST` | `/admin/api/settings/refresh-models`    | 管理员        | 立即刷新模型目录                                      |
-| `GET`  | `/admin/api/stats?days=N`               | 管理员        | 按天 / 用户 / 模型 / 账号汇总                         |
-| `GET`  | `/admin/api/usage`                      | 管理员        | 用量搜索，参数同英文文档                              |
+- **OAuth 登录**：界面（或 `ccm-server admin account login`）打开 Claude 授权页，同意后页面显示
+  `code#state`，粘贴回来即可。如果把 `upstream.oauth_redirect_uri` 设为
+  `http://<主机>:8787/oauth/callback`（且 client id 允许），登录会自动完成。
+- **导入**：任意常见格式的 `.credentials.json`，或它们组成的 JSON 数组（元素可以是
+  `{"label","account_group","credentials"}`）。邮箱相同的账号会更新而不是重复添加，重新登录也靠这个
+  清除"需重新登录"状态。
+- **单个账号**：标签、优先级、权重、分组、代理、启用 / 禁用、置顶、立即刷新、解除冷却、删除。
+  配了代理的账号所有请求都只走代理，不会回落直连。
 
-管理员认证：`Authorization: Bearer <令牌>`、`x-admin-token` 或 `ccm_admin` cookie。
-`/v1/*` 的错误统一是 Anthropic 格式 `{"type":"error","error":{"type","message"}}`；
-管理接口的错误是 `{"error": "..."}`。
+## 调度与故障切换
 
-## 命令行
+每个请求只在以下账号里选：启用、属于该终端的账号组（策略里的 `account_group`，不设则全部）、
+状态正常、不在冷却中。其中优先用额度低于 `pool.quota_soft_limit` 的；会话之前绑定的账号仍健康就继续用
+（会话取 Claude Code 的 `metadata.user_id`，没有则按终端 Key）；否则按 `pool.strategy` 选。
+
+在给客户端写出任何字节之前，失败会换下一个账号（最多再试 `pool.max_retries` 个）：
+
+| 上游结果                            | 处理                                                          |
+| ----------------------------------- | ------------------------------------------------------------- |
+| 429                                 | 冷却到 `retry-after` / `anthropic-ratelimit-*-reset`（没有则 `pool.cooldown_secs`） |
+| 401                                 | 强制刷新 token（没有 refresh token 则标记需重新登录）          |
+| 403                                 | 冷却 30 分钟                                                  |
+| 500 / 502 / 503 / 504 / 529、网络错误 | 直接换下一个，不冷却                                         |
+| 其他                                | 原样返回                                                      |
+
+账号试完时把最后一次上游响应原样返回；所有可用账号都在冷却时直接返回 429 和 `retry-after`，
+不再请求上游。冷却时间存在数据库里，重启不丢。
+
+**额度**：每次上游响应的 `anthropic-ratelimit-unified-5h/7d-*` 响应头都会更新该账号的额度快照，
+在界面、托盘和 `/metrics` 里显示。设置 `upstream.usage_url` 可以额外定时主动查询。
+
+## OpenAI 兼容
+
+`POST /v1/chat/completions` 与 Messages 双向转换：system / developer 消息、文本和图片
+（data URL 或 http URL）、tools 与 `tool_choice`、assistant 的 `tool_calls` 和 `tool` 结果、`stop`、
+`max_completion_tokens`、`reasoning_effort`（映射到 effort 档位）、`stream` 与
+`stream_options.include_usage`。响应包含 `tool_calls`、`reasoning_content` 和 usage。
+用模型路由把 OpenAI 模型名映射过来，例如 `re:^gpt-4` → `claude-sonnet-4-5`。
+
+## 接口与命令行
+
+完整接口表和命令行用法见 [README.md](./README.md#http-api)。常用命令：
 
 ```sh
-ccm-server serve                               # 默认命令
-ccm-server config                              # 打印生效配置（隐去密钥）
-
-# 管理（需要 CCM_ADMIN_TOKEN；CCM_ADMIN_URL 默认 http://127.0.0.1:8787）
-ccm-server admin status
+ccm-server admin account login --label 我的 Max
+ccm-server admin account import --file ~/.claude/.credentials.json
+ccm-server admin account set 2 --priority 10 --group team --proxy socks5://127.0.0.1:1080
 ccm-server admin invite create --label alice --ttl-hours 24
-ccm-server admin user list | create --label x | enable 3 | disable 3
-ccm-server admin user policy 3 --allow claude-sonnet-4-5 --rpm 10 --daily-tokens 2000000
-ccm-server admin key issue 3 | revoke 7
-ccm-server admin account list
-ccm-server admin account set 2 --priority 10 --weight 3 --group team --clear-cooldown
-ccm-server admin user policy 3 --group team         # 把终端绑定到账号组
-ccm-server admin models list | disable claude-opus-4-1 | refresh
-ccm-server admin stats --days 7
-ccm-server admin usage --status error
-ccm-server admin reset-token [--token 新令牌]   # 直接写本地数据库
-
-# effort 档位
-ccm-server effort list
-ccm-server effort expand --tier high
-```
-
-**忘了管理员令牌**：在主机上执行 `ccm-server admin reset-token`（正在运行的服务一分钟内生效），
-或者用 `admin.initial_token` / `CCM_ADMIN_TOKEN` 固定一个，每次启动都会写入。
-
-## 从 Go 版 cliproxy 迁移
-
-```sh
+ccm-server admin user policy 3 --rpm 10 --daily-tokens 2000000 --group team
+ccm-server admin models routes 're:^gpt-4=claude-sonnet-4-5'
+ccm-server admin reset-token                      # 忘了管理员令牌时，直接写本地数据库
 ccm-server migrate-from-go --go-data-dir ~/.local/share/cliproxy
 ```
 
-把用户、Key、邀请码、策略、管理员令牌、禁用模型和用量历史复制到一个**全新的**
-CC Manager 数据目录，ID 保持不变，所以原来的 `sk-cp-…` Key 和管理员令牌可以继续用。
-上游账号用 Go 版的 `secret.key`（或 `--go-secret-key`）解密后重新加密。
-
-## 多账号
-
-所有启用的账号都是候选。每个请求：
-
-1. 先筛选：属于该用户的账号组（用户策略里的 `account_group`，不设则所有账号都可用）、
-   状态为 `active`、不在冷却中。
-2. 会话之前绑定的账号仍然健康就继续用它（会话取 Claude Code 的 `metadata.user_id`，
-   没有则按终端 Key），这样 Anthropic 的 prompt cache 能持续命中。
-3. 否则按 `pool.strategy` 选：`priority`（优先级最高，其次最早添加）、
-   `round_robin`（按 `weight` 平滑加权轮询）、`least_used`（近 5 小时 token 用量最少）。
-
-在向客户端写出任何字节之前，失败的尝试会换下一个账号重试，最多再试 `pool.max_retries` 次：
-
-| 上游结果                     | 处理                                                          |
-| ---------------------------- | ------------------------------------------------------------- |
-| 429                          | 冷却到 `retry-after` / `anthropic-ratelimit-*-reset`（没有则 `pool.cooldown_secs`），换下一个 |
-| 401                          | 强制刷新 token（没有 refresh token 则标记 `needs_reauth`），换下一个 |
-| 403                          | 冷却 30 分钟，换下一个                                        |
-| 500 / 502 / 503 / 504 / 529、网络错误 | 直接换下一个，不冷却                                  |
-| 其他                         | 原样返回                                                      |
-
-账号用完时，把最后一次上游响应原样返回。如果所有可用账号都已在冷却，直接返回 429
-`rate_limit_error` 并带上最早恢复时间的 `retry-after`，不再请求上游。冷却时间存在数据库里，
-重启后依然有效。每次失败的尝试都会记入用量，错误以 `failover: …` 开头。
-
 ## 运行说明
 
-- **effort 档位**：请求体顶层可以带 `"effort"`，自动补上 `max_tokens` 和 extended thinking；
-  转发前会删掉该字段；请求里已有的 `max_tokens` / `thinking` 优先；未知档位返回 400。
-  默认档位：auto 8192 / low 4096 / medium 16384+5000 / high 32768+15000 /
-  xhigh 48000+30000 / max 64000+60000。
+- **effort 档位**：请求体顶层的 `"effort"` 会补上 `max_tokens` 和 extended thinking
+  （auto 8192 · low 4096 · medium 16384+5000 · high 32768+15000 · xhigh 48000+30000 · max 64000+60000）；
+  请求里已有的值优先；未知档位返回 400。
 - **system 注入**：OAuth Pro/Max 接口要求第一个 system 块是
-  `You are Claude Code, Anthropic's official CLI for Claude.`，否则会返回误导性的
-  `rate_limit_error: "Error"`。缺少时自动补上；已有的请求原样透传。
-  可用 `upstream.inject_claude_code_system: false` 关闭。
-- **上游错误**：状态码、响应头（`retry-after`、`anthropic-ratelimit-*`）和响应体原样转发；
-  错误类型、消息和 `request_id` 会写日志并存入 `usage_events.error`。
-- **OAuth 刷新**：过期前 60 秒内自动刷新；refresh token 被拒时账号标记为 `needs_reauth`。
+  `You are Claude Code, Anthropic's official CLI for Claude.`，否则返回误导性的 `rate_limit_error`。
+  缺少时自动补上，可用 `upstream.inject_claude_code_system` 关闭。
+- **上游错误**：状态码、响应头和响应体原样转发，错误摘要（含 `request_id`）写日志并记入用量。
+- **监控**：`/metrics` 按账号和状态码给出请求数、token 计数、账号可用 / 冷却和额度利用率，
+  用管理员令牌作为 Bearer 抓取。
 - **备份**：备份 `data_dir`（`cc-manager.db` + `secret.key`）。
 
 ## 开发
 
 ```sh
+pnpm install && pnpm build          # 网页界面（编译 ccm-server 时内嵌）
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-pnpm install && pnpm build
+cargo run -p ccm-server -- serve    # 无界面
+pnpm tauri dev                      # 桌面端；`pnpm tauri build` 打安装包
 ```
+
+Linux 编译桌面端需要 `libwebkit2gtk-4.1-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`。
+推送 `v*` 标签会触发发布流水线：三平台安装包、`ccm-server` 二进制、`ghcr.io` 镜像，生成草稿 Release。

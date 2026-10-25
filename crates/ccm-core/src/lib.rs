@@ -8,6 +8,7 @@ pub mod config;
 pub mod events;
 pub mod http;
 pub mod login;
+mod metrics;
 pub mod oauth;
 mod onboard;
 pub mod openai;

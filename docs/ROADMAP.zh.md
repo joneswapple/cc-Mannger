@@ -27,7 +27,7 @@ index.html, package.json   # Vite 入口
 scripts/                   # install.sh / install.ps1 等
 ```
 
-**进度**：R0、R1、R2 已完成，Go 版 cliproxy 已删除（旧数据用 `ccm-server migrate-from-go` 迁移）。
+**进度**：R0–R6 全部完成，Go 版 cliproxy 已删除（旧数据用 `ccm-server migrate-from-go` 迁移）。
 
 ## 2. 功能对照
 
@@ -86,34 +86,39 @@ scripts/                   # install.sh / install.ps1 等
 - 实现说明：403 没有直接禁用账号，而是冷却 30 分钟（避免一次误判就要手动恢复）；
   所有可用账号都在冷却时本地直接返回 429 + `retry-after`；冷却存在 `accounts.cooldown_until`，重启不丢。
 
-### R3：账号管理界面（登录 / 导入 / 切换）
+### R3：账号管理界面（登录 / 导入 / 切换）（已完成）
 
 - OAuth PKCE 登录：授权链接、本地回调端口、手动粘贴 `code#state`；拉取邮箱 / 组织 / 套餐。
 - 导入：credentials JSON、批量 JSON、macOS Keychain。
 - React 页面：账号列表 / 卡片、启用禁用、优先级、标签、代理、强制刷新、删除、置顶；
   用户 / 邀请码 / Key / 策略 / 统计页（替代 Go 版的服务端渲染面板）。
 - 桌面端通过 Tauri command 调用，无界面模式走 `/admin/api/*`，前端共用一套 API 封装。
+- 实现说明：桌面端没有给每个接口单独写 Tauri command，而是用一个 `admin_request` 桥接命令在进程内调用同一套
+  `/admin/api/*` 路由，两种模式行为完全一致。
 - CLI：`ccm-server account …` / `admin …` 子命令（clap）。
 
-### R4：额度监控与托盘
+### R4：额度监控与托盘（已完成）
 
 - 被动采集上游响应头里的 5h / 7d 利用率与重置时间，存快照；可选定时主动探测。
 - 调度器按利用率降权，重置后恢复。
 - 面板：进度条、重置倒计时、推荐账号；托盘：当前账号 + 额度、快速切换、启停代理。
 - 账号失效或全部冷却时发系统通知。
 
-### R5：模型路由与 OpenAI 兼容
+### R5：模型路由与 OpenAI 兼容（已完成）
 
 - 别名 / 正则模型映射；后台小请求降级到 Haiku；按账号可用模型过滤。
+- 实现说明：按账号可用模型过滤没有做（Pro/Max 各账号可用模型基本一致，收益低）；后台降级默认关闭。
 - OpenAI `/v1/chat/completions`（流式 / 非流式、tools、图片输入、usage 映射）。
 
-### R6：打包与发布
+### R6：打包与发布（已完成）
 
 - Tauri bundler：Windows NSIS（中英文安装界面、`installerHooks` 处理旧版残留和防火墙规则）、
   Linux AppImage / deb、macOS dmg。
 - `scripts/install.sh`、`scripts/install.ps1`；Dockerfile + docker-compose（`ccm-server`）。
 - GitHub Actions：三平台构建矩阵、自动发布 Release。
 - 每账号出站代理（HTTP / SOCKS5）、`/metrics`、客户端配置一键生成（Claude Code `settings.json`、环境变量）。
+- 实现说明：每账号代理在 R3 一并实现；NSIS 钩子负责添加 / 删除防火墙规则（旧版残留由 Tauri 安装器自身处理）；
+  Docker 镜像和三平台发布流水线已写好，但本开发环境没有 Docker 守护进程，也无法运行 GitHub Actions，需在 CI 上首次验证。
 
 ## 4. 风险与说明
 

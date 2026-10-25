@@ -2,7 +2,7 @@ import { useState } from "react";
 import { get } from "../api";
 import { fmtNum, fmtTime } from "../format";
 import type { Stats, UsagePage } from "../types";
-import { Badge, Button, Card, ErrorBox, inputClass, useLoad } from "../ui";
+import { Badge, Button, Card, ErrorBox, inputBase, useLoad } from "../ui";
 
 export default function Usage() {
   const [days, setDays] = useState(7);
@@ -23,7 +23,7 @@ export default function Usage() {
       <Card
         title="汇总"
         actions={
-          <select className={inputClass} value={days} onChange={(e) => setDays(Number(e.target.value))}>
+          <select className={inputBase} value={days} onChange={(e) => setDays(Number(e.target.value))}>
             {[1, 7, 30, 90].map((d) => (
               <option key={d} value={d}>
                 最近 {d} 天
@@ -41,7 +41,7 @@ export default function Usage() {
                 {stats.data.by_day.map((d) => {
                   const total = d.input_tokens + d.output_tokens;
                   return (
-                    <div key={d.date} className="flex flex-1 flex-col items-center" title={`${d.date}：${d.requests} 次，${total.toLocaleString()} tokens`}>
+                    <div key={d.date} className="flex h-full max-w-12 flex-1 flex-col justify-end" title={`${d.date}：${d.requests} 次，${total.toLocaleString()} tokens`}>
                       <div className="w-full rounded-t bg-orange-500" style={{ height: `${(total / maxDay) * 100}%`, minHeight: total ? 2 : 0 }} />
                     </div>
                   );
@@ -66,16 +66,16 @@ export default function Usage() {
             setApplied(filter);
           }}
         >
-          <input className={`${inputClass} w-48`} placeholder="搜索模型 / 用户 / 错误" value={filter.q} onChange={(e) => setFilter({ ...filter, q: e.target.value })} />
-          <input className={`${inputClass} w-40`} placeholder="模型" value={filter.model} onChange={(e) => setFilter({ ...filter, model: e.target.value })} />
-          <select className={`${inputClass} w-32`} value={filter.status} onChange={(e) => setFilter({ ...filter, status: e.target.value })}>
+          <input className={`${inputBase} w-48`} placeholder="搜索模型 / 用户 / 错误" value={filter.q} onChange={(e) => setFilter({ ...filter, q: e.target.value })} />
+          <input className={`${inputBase} w-40`} placeholder="模型" value={filter.model} onChange={(e) => setFilter({ ...filter, model: e.target.value })} />
+          <select className={`${inputBase} w-32`} value={filter.status} onChange={(e) => setFilter({ ...filter, status: e.target.value })}>
             <option value="">全部状态</option>
             <option value="ok">成功</option>
             <option value="error">失败</option>
             <option value="429">429</option>
             <option value="5xx">5xx</option>
           </select>
-          <select className={`${inputClass} w-36`} value={filter.sort} onChange={(e) => setFilter({ ...filter, sort: e.target.value })}>
+          <select className={`${inputBase} w-36`} value={filter.sort} onChange={(e) => setFilter({ ...filter, sort: e.target.value })}>
             <option value="time_desc">最新优先</option>
             <option value="tokens_desc">token 最多</option>
             <option value="latency_desc">耗时最长</option>

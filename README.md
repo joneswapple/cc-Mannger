@@ -1,10 +1,10 @@
 # CC Manager
 
 A desktop app (Tauri) and headless server that let a LAN of terminals share
-your logged-in **Claude Pro/Max** accounts. You log in once on the host;
-CC Manager keeps the OAuth tokens (encrypted), refreshes them on demand, and
-forwards Anthropic Messages API requests from per-terminal API keys it
-issues itself. Modelled on
+your logged-in **Claude Pro/Max** accounts. CC Manager keeps the accounts'
+OAuth tokens (encrypted), refreshes them, spreads requests across them with
+failover, and forwards Anthropic Messages API — and OpenAI Chat Completions —
+requests from per-terminal API keys it issues itself. Modelled on
 [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager),
 for Claude only.
 
@@ -16,248 +16,271 @@ for Claude only.
 
 ## What you get
 
-- `POST /v1/messages` — Anthropic-compatible endpoint with SSE streaming
-  pass-through. Point `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` at it and an
-  unmodified `claude` works.
-- Invite-based self-service registration: each terminal redeems an invite
-  for its own `sk-cp-…` key (bcrypt-hashed at rest, shown once).
-- Per-user policies (enable/disable, model allowlist, RPM, daily token quota)
-  plus a global model denylist.
-- Usage stats per request (tokens, latency, status, upstream account) with
-  daily / per-user / per-model / per-account rollups.
-- Upstream accounts stored in SQLite with AES-256-GCM encrypted tokens; the
-  host's Claude Code login is imported automatically on first start.
-- Multiple accounts with scheduling (priority / weighted round-robin /
-  least-used), sticky sessions that keep prompt caches warm, automatic
-  failover on 429 / 401 / 403 / 5xx with cooldowns, and account groups.
-- Two shells over one Rust core: the **desktop app** (window + tray, proxy
-  runs in-process) and **`ccm-server`** (headless, for servers / Docker).
+- **Proxy**: `POST /v1/messages` (Anthropic, SSE pass-through) and
+  `POST /v1/chat/completions` (OpenAI-compatible, streaming, tools, images).
+  Point `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` at it and an unmodified
+  `claude` works.
+- **Accounts**: OAuth login (PKCE), import of Claude Code credentials (file,
+  batch JSON, macOS keychain), the host's login imported automatically,
+  tokens AES-256-GCM encrypted, optional per-account HTTP/SOCKS5 proxy.
+- **Scheduling**: priority / weighted round-robin / least-used, sticky
+  sessions that keep prompt caches warm, automatic failover on
+  429 / 401 / 403 / 5xx with cooldowns, account groups, and quota awareness
+  (5-hour / 7-day usage read from Anthropic's rate-limit headers).
+- **Terminals**: invite-based self-registration, `sk-cp-…` keys (bcrypt,
+  shown once), per-terminal policies (model allowlist, RPM, daily tokens,
+  account group), a global model denylist and model routes (aliases/regex).
+- **Admin**: React web UI (desktop window or browser), JSON API, CLI, usage
+  stats and search, Prometheus `/metrics`.
+- **Desktop**: tray with current account and quota, account switching,
+  start/stop, notifications when an account needs a new login or everything
+  is rate limited. Installers: NSIS (Windows), AppImage/deb, dmg.
+- **Headless**: `ccm-server` single binary with the UI embedded, Docker image,
+  install scripts.
 
-## Quickstart (headless)
+## Quickstart
+
+### Desktop
+
+Download the installer from the [releases](https://github.com/joneswapple/cc-Mannger/releases)
+(or build it, see Development). On first start it imports the Claude Code
+login found on the machine and starts the proxy on port 8787. Add more
+accounts under **上游账号 → OAuth 登录**, create a terminal under **终端**, and
+copy the snippets from **接入**.
+
+### Headless
 
 ```sh
-# 1. Build
-cargo build --release -p ccm-server
+# Install (Linux/macOS; Windows: scripts/install.ps1) or `cargo build --release -p ccm-server`
+curl -fsSL https://raw.githubusercontent.com/joneswapple/cc-Mannger/main/scripts/install.sh | sh
 
-# 2. Make sure Claude Code is logged in on this host (`claude /login`).
-#    Credentials live at ~/.claude/.credentials.json by default.
+ccm-server serve                     # prints the admin token on first start
+# open http://<host>:8787/ and sign in with the admin token
+```
 
-# 3. Start. On first run an admin token is printed — save it.
-./target/release/ccm-server serve        # or: --config ./config.json
+Or with Docker: `docker compose up -d` (see [docker-compose.yml](./docker-compose.yml)),
+then `docker compose logs` for the admin token.
 
-# 4. Create an invite (admin CLI talks to the running server):
-export CCM_ADMIN_TOKEN=<admin-token>
-./target/release/ccm-server admin invite create --label alice-laptop
+### Connect a terminal
 
-# 5. From a LAN client, redeem it for an API key:
-curl -X POST http://<host>:8787/register \
-     -H "Content-Type: application/json" \
+```sh
+# Redeem an invite (created in the UI or with `ccm-server admin invite create`)
+curl -X POST http://<host>:8787/register -H "Content-Type: application/json" \
      -d '{"token":"<invite-token>","label":"alice"}'
 
-# 6. Point Claude Code at the proxy:
 export ANTHROPIC_BASE_URL=http://<host>:8787
 export ANTHROPIC_API_KEY=sk-cp-...
 claude
 ```
 
-## Desktop app
-
-```sh
-pnpm install
-pnpm tauri dev      # development
-pnpm tauri build    # installers: NSIS (Windows), AppImage/deb (Linux), dmg (macOS)
-```
-
-On Linux, building needs `libwebkit2gtk-4.1-dev`,
-`libayatana-appindicator3-dev` and `librsvg2-dev`. Closing the window keeps
-the proxy running in the tray. The desktop app reads
-`<app config dir>/config.json` and shares the same data dir as `ccm-server`.
+OpenAI clients use `base_url=http://<host>:8787/v1` with the same key.
 
 ## Configuration
 
 Precedence: code defaults → `config.json` → `CCM_*` environment variables.
-A full sample is [`config.example.json`](./config.example.json).
+A full sample is [`config.example.json`](./config.example.json). The desktop
+app reads `<app config dir>/config.json`; `ccm-server` takes `--config` /
+`CCM_CONFIG`.
 
-| JSON key                          | Env override                     | Default                                        |
-| --------------------------------- | -------------------------------- | ---------------------------------------------- |
-| `listen`                          | `CCM_LISTEN`                     | `0.0.0.0:8787`                                 |
-| `data_dir`                        | `CCM_DATA_DIR`                   | `<platform data dir>/cc-manager`               |
-| `log_level`                       | `CCM_LOG_LEVEL` (or `RUST_LOG`)  | `info`                                         |
-| `secret_key`                      | `CCM_SECRET_KEY`                 | empty → `data_dir/secret.key` (auto-created)   |
-| `upstream.base_url`               | `CCM_UPSTREAM_BASE_URL`          | `https://api.anthropic.com`                    |
-| `upstream.credentials_path`       | `CCM_CREDENTIALS_PATH`           | auto-detect (see below)                        |
-| `upstream.sync_credentials_file`  | `CCM_SYNC_CREDENTIALS_FILE`      | `true`                                         |
-| `upstream.oauth_token_url`        | —                                | `https://console.anthropic.com/v1/oauth/token` |
-| `upstream.oauth_client_id`        | —                                | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`         |
-| `upstream.anthropic_beta`         | —                                | `claude-code-20250219,oauth-2025-04-20`        |
-| `upstream.user_agent`             | —                                | `claude-cli/1.0 (cc-manager)`                  |
+| JSON key                             | Env override                  | Default                                        |
+| ------------------------------------ | ----------------------------- | ---------------------------------------------- |
+| `listen`                             | `CCM_LISTEN`                  | `0.0.0.0:8787`                                 |
+| `data_dir`                           | `CCM_DATA_DIR`                | `<platform data dir>/cc-manager`               |
+| `log_level`                          | `CCM_LOG_LEVEL` / `RUST_LOG`  | `info`                                         |
+| `secret_key`                         | `CCM_SECRET_KEY`              | empty → `data_dir/secret.key` (auto-created)   |
+| `admin.initial_token`                | `CCM_ADMIN_TOKEN`             | empty → random token printed on first start    |
+| `upstream.base_url`                  | `CCM_UPSTREAM_BASE_URL`       | `https://api.anthropic.com`                    |
+| `upstream.credentials_path`          | `CCM_CREDENTIALS_PATH`        | auto-detect (see below)                        |
+| `upstream.sync_credentials_file`     | `CCM_SYNC_CREDENTIALS_FILE`   | `true`                                         |
+| `upstream.oauth_token_url`           | —                             | `https://console.anthropic.com/v1/oauth/token` |
+| `upstream.oauth_client_id`           | —                             | `9d1c250a-e61b-44d9-88ed-5944d1962f5e`         |
+| `upstream.oauth_authorize_url`       | —                             | `https://claude.ai/oauth/authorize`            |
+| `upstream.oauth_redirect_uri`        | —                             | `https://console.anthropic.com/oauth/code/callback` |
+| `upstream.oauth_scopes`              | —                             | `org:create_api_key user:profile user:inference` |
+| `upstream.profile_url`               | —                             | `https://api.anthropic.com/api/oauth/profile`  |
+| `upstream.usage_url`                 | —                             | empty (no polling; headers are still read)     |
+| `upstream.usage_poll_secs`           | —                             | `600`                                          |
+| `upstream.anthropic_beta`            | —                             | `claude-code-20250219,oauth-2025-04-20`        |
+| `upstream.user_agent`                | —                             | `claude-cli/1.0 (cc-manager)`                  |
 | `upstream.inject_claude_code_system` | —                             | `true`                                         |
-| `upstream.effort_levels`          | —                                | see "Effort tiers"                             |
-| `pool.strategy`                   | `CCM_POOL_STRATEGY`              | `priority` (`round_robin`, `least_used`)       |
-| `pool.sticky`                     | `CCM_POOL_STICKY`                | `true`                                         |
-| `pool.sticky_ttl_secs`            | —                                | `3600`                                         |
-| `pool.max_retries`                | `CCM_POOL_MAX_RETRIES`           | `2`                                            |
-| `pool.cooldown_secs`              | —                                | `60`                                           |
-| `admin.initial_token`             | `CCM_ADMIN_TOKEN`                | empty → random token printed on first start    |
+| `upstream.effort_levels`             | —                             | see "Operating notes"                          |
+| `pool.strategy`                      | `CCM_POOL_STRATEGY`           | `priority` (`round_robin`, `least_used`)       |
+| `pool.sticky`                        | `CCM_POOL_STICKY`             | `true`                                         |
+| `pool.sticky_ttl_secs`               | —                             | `3600`                                         |
+| `pool.max_retries`                   | `CCM_POOL_MAX_RETRIES`        | `2`                                            |
+| `pool.cooldown_secs`                 | —                             | `60`                                           |
+| `pool.quota_soft_limit`              | —                             | `0.95`                                         |
+| `routing.background_model`           | —                             | empty (off)                                    |
+| `routing.background_max_tokens`      | —                             | `512`                                          |
 
-`ccm-server` also reads `--config` / `CCM_CONFIG` for the config path.
+None of the OAuth / profile / usage endpoints are publicly documented; they
+are configurable so they can be adjusted if Anthropic changes them.
 
-**Accounts and the secret key.** Upstream tokens are encrypted with
-`secret_key` or `data_dir/secret.key`. Back that key up together with
-`cc-manager.db` — without it stored tokens can't be decrypted. When no
-account exists yet, the Claude Code credentials file is imported as account
-#1, looked up in this order: `upstream.credentials_path`,
-`$CLAUDE_CREDENTIALS_PATH`, `$CLAUDE_CONFIG_DIR/.credentials.json`,
+**Secret key.** Upstream tokens are encrypted with `secret_key` or
+`data_dir/secret.key`. Back that key up together with `cc-manager.db`.
+
+**Host login.** When no account exists yet, the Claude Code credentials file
+is imported as account #1: `upstream.credentials_path`,
+`$CLAUDE_CREDENTIALS_PATH`, `$CLAUDE_CONFIG_DIR/.credentials.json`, then
 `~/.claude/.credentials.json`. With `sync_credentials_file` on, that file
-stays authoritative (re-read before refreshes, rewritten after), so the
-host's own `claude` keeps working alongside CC Manager. On macOS, export the
-keychain entry first:
-`security find-generic-password -s "Claude Code-credentials" -w > ~/.claude/.credentials.json`.
+stays authoritative so the host's own `claude` keeps working. On macOS,
+import from the keychain with `ccm-server admin account import --from-keychain`.
+
+## Accounts
+
+- **OAuth login**: the UI (or `ccm-server admin account login`) opens
+  Claude's authorize page; after you approve, the page shows `code#state` —
+  paste it back. If you point `upstream.oauth_redirect_uri` at
+  `http://<host>:8787/oauth/callback` (and the client id accepts it), the
+  login completes automatically.
+- **Import**: a `.credentials.json` document in any common shape, or a JSON
+  array of them (items may be `{"label","account_group","credentials"}`).
+  An account with the same email is updated rather than duplicated, which is
+  also how a re-login clears `needs_reauth`.
+- **Per account**: label, priority, weight, group, proxy, enable/disable,
+  pin (move to top priority), refresh now, clear cooldown, delete. An
+  account with a proxy sends everything through it and never falls back to
+  a direct connection.
+
+## Scheduling and failover
+
+For each request CC Manager keeps accounts that are enabled, in the user's
+group (`account_group` in the policy; unset = all), `active` and not cooling
+down; prefers those under `pool.quota_soft_limit`; reuses the session's
+sticky account (Claude Code's `metadata.user_id`, else the terminal key);
+otherwise applies `pool.strategy` — `priority`, `round_robin` (smooth,
+weighted) or `least_used` (fewest tokens in 5 hours).
+
+Before any byte reaches the client, failed attempts move to the next account
+(up to `pool.max_retries` more):
+
+| Upstream result                         | Action                                                       |
+| --------------------------------------- | ------------------------------------------------------------ |
+| 429                                     | cool down until `retry-after` / `anthropic-ratelimit-*-reset` (else `pool.cooldown_secs`) |
+| 401                                     | force a token refresh (no refresh token → `needs_reauth`)    |
+| 403                                     | cool down 30 minutes                                         |
+| 500 / 502 / 503 / 504 / 529, network     | try the next account, no cooldown                            |
+| anything else                           | forward as is                                                |
+
+When accounts run out, the last upstream response is forwarded verbatim. If
+every eligible account is already cooling, the proxy answers 429 with a
+`retry-after` without calling upstream. Cooldowns survive restarts.
+
+**Quota.** Every upstream response's `anthropic-ratelimit-unified-5h/7d-*`
+headers update the account's usage snapshot (shown in the UI, tray and
+`/metrics`). Set `upstream.usage_url` to also poll a usage endpoint.
+
+## OpenAI compatibility
+
+`POST /v1/chat/completions` translates to Messages and back: system /
+developer messages, text and image parts (data or http URLs), tools and
+`tool_choice`, assistant `tool_calls` and `tool` results, `stop`,
+`max_completion_tokens`, `reasoning_effort` (mapped to the effort tiers),
+`stream` with `stream_options.include_usage`. Responses carry `tool_calls`,
+`reasoning_content` and usage. Use model routes to map OpenAI model names,
+e.g. `re:^gpt-4` → `claude-sonnet-4-5`. `/v1/models` includes both Anthropic
+and OpenAI fields.
 
 ## HTTP API
 
-Timestamps in admin responses are unix seconds.
+Admin endpoints need `Authorization: Bearer <admin token>` (or
+`x-admin-token`, or the `ccm_admin` cookie); timestamps are unix seconds.
 
-| Method | Path                                      | Auth            | Description                                           |
-| ------ | ----------------------------------------- | --------------- | ----------------------------------------------------- |
-| `POST` | `/v1/messages`                            | `x-api-key`     | Anthropic Messages endpoint (SSE + JSON).             |
-| `POST` | `/v1/messages/count_tokens`               | `x-api-key`     | Token counting passthrough; no policy, no stats.      |
-| `GET`  | `/v1/models`                              | `x-api-key`     | Models from the cached upstream catalog.              |
-| `POST` | `/register`                               | invite (body)   | `{token, label}` → `{api_key, user_id}`.              |
-| `GET`  | `/healthz`                                | —               | Liveness: `{status, version}`.                        |
-| `GET`  | `/admin/api/status`                       | admin           | Version, accounts, upstream source, catalog state.    |
-| `GET`  | `/admin/api/users`                        | admin           | Users with keys (no hashes) and policies.             |
-| `POST` | `/admin/api/users`                        | admin           | Create a user (`{label}`).                            |
-| `POST` | `/admin/api/users/{id}/{enable,disable}`  | admin           | Toggle a user.                                        |
-| `GET` `POST` | `/admin/api/users/{id}/policy`      | admin           | Read / replace `{allowed_models, daily_token_limit, rpm_limit}`. |
-| `POST` | `/admin/api/keys/issue`                   | admin           | `{user_id}` → `{api_key, key_id}`.                    |
-| `POST` | `/admin/api/keys/{id}/revoke`             | admin           | Revoke a key.                                         |
-| `GET` `POST` | `/admin/api/invites`                | admin           | List / create (`{label, ttl_hours}` → `{token, expires_at}`). |
-| `POST` | `/admin/api/invites/{hash}/delete`        | admin           | Delete an unredeemed invite.                          |
-| `GET`  | `/admin/api/accounts`                     | admin           | Upstream accounts (metadata only, never tokens), pool config, `now`. |
-| `POST` | `/admin/api/accounts/{id}`                | admin           | Update `{label, priority, weight, enabled, account_group, clear_cooldown}`. |
-| `GET`  | `/admin/api/settings`                     | admin           | Denylist, model catalog, upstream wire settings.      |
-| `POST` | `/admin/api/settings/disabled-models`     | admin           | Replace the global denylist (`{models: [...]}`).      |
-| `POST` | `/admin/api/settings/refresh-models`      | admin           | Refetch the model catalog now.                        |
-| `GET`  | `/admin/api/stats?days=N`                 | admin           | Rollups by day, user, model, account.                 |
-| `GET`  | `/admin/api/usage`                        | admin           | Search: `q`, `user_id`, `account_id`, `model`, `status` (`ok`\|`error`\|`2xx`…`5xx`\|code), `since`/`until` (unix or `YYYY-MM-DDTHH:MM` UTC), `min_tokens`, `only_error`, `sort` (`time_desc`\|`time_asc`\|`tokens_desc`\|`tokens_asc`\|`latency_desc`\|`latency_asc`), `page`, `page_size`. |
+| Method | Path                                         | Auth          | Description                                             |
+| ------ | -------------------------------------------- | ------------- | ------------------------------------------------------- |
+| `POST` | `/v1/messages`                               | API key       | Anthropic Messages (SSE + JSON).                        |
+| `POST` | `/v1/chat/completions`                       | API key       | OpenAI Chat Completions.                                |
+| `POST` | `/v1/messages/count_tokens`                  | API key       | Token counting; no policy, no stats.                    |
+| `GET`  | `/v1/models`                                 | API key       | Cached upstream model catalog.                          |
+| `POST` | `/register`                                  | invite        | `{token, label}` → `{api_key, user_id}`.                |
+| `GET`  | `/oauth/callback`                            | login state   | OAuth redirect target.                                  |
+| `GET`  | `/healthz`                                   | —             | `{status, version}`.                                    |
+| `GET`  | `/metrics`                                   | admin         | Prometheus metrics.                                     |
+| `GET`  | `/`                                          | —             | Web UI (ccm-server).                                    |
+| `GET`  | `/admin/api/status`                          | admin         | Version, accounts, upstream, catalog.                   |
+| `GET`  | `/admin/api/accounts`                        | admin         | Accounts with quota (never tokens), pool config, recommended account. |
+| `POST` | `/admin/api/accounts/oauth/start`            | admin         | `{label?, account_group?}` → `{url, state}`.            |
+| `POST` | `/admin/api/accounts/oauth/complete`         | admin         | `{code, state?}` → account.                             |
+| `POST` | `/admin/api/accounts/import`                 | admin         | `{credentials, label?, account_group?}` → `{imported, errors}`. |
+| `POST` | `/admin/api/accounts/{id}`                   | admin         | Update `{label, priority, weight, enabled, account_group, proxy_url, clear_cooldown}`. |
+| `POST` | `/admin/api/accounts/{id}/{refresh,pin,delete}` | admin      | Refresh token + profile / move to top / delete.         |
+| `GET` `POST` | `/admin/api/users`                     | admin         | List (keys, policies) / create `{label}`.               |
+| `POST` | `/admin/api/users/{id}/{enable,disable}`     | admin         | Toggle a user.                                          |
+| `GET` `POST` | `/admin/api/users/{id}/policy`         | admin         | `{allowed_models, daily_token_limit, rpm_limit, account_group}`. |
+| `POST` | `/admin/api/keys/issue`, `/keys/{id}/revoke` | admin         | Issue (shown once) / revoke a key.                      |
+| `GET` `POST` | `/admin/api/invites`, `/invites/{hash}/delete` | admin   | Invites.                                                |
+| `GET`  | `/admin/api/settings`                        | admin         | Denylist, model routes, catalog, wire settings.         |
+| `POST` | `/admin/api/settings/disabled-models`        | admin         | `{models}`.                                             |
+| `POST` | `/admin/api/settings/model-routes`           | admin         | `{routes: [{pattern, target}]}` (`re:` for regex).      |
+| `POST` | `/admin/api/settings/refresh-models`         | admin         | Refetch the model catalog.                              |
+| `GET`  | `/admin/api/stats?days=N`                    | admin         | Rollups by day, user, model, account.                   |
+| `GET`  | `/admin/api/usage`                           | admin         | Search: `q`, `user_id`, `account_id`, `model`, `status`, `since`, `until`, `min_tokens`, `only_error`, `sort`, `page`, `page_size`. |
 
-Admin auth: `Authorization: Bearer <token>`, `x-admin-token`, or the
-`ccm_admin` cookie. Errors from `/v1/*` use Anthropic's
-`{"type":"error","error":{"type","message"}}` shape; admin errors are
+Errors under `/v1/*` use Anthropic's `{"type":"error","error":{"type","message"}}`
+shape (OpenAI SDKs read `error.message` from it too); admin errors are
 `{"error": "..."}`.
 
 ## CLI
 
 ```sh
-ccm-server serve                               # default command
-ccm-server config                              # effective config, secrets redacted
-
-# Admin (needs CCM_ADMIN_TOKEN; CCM_ADMIN_URL defaults to http://127.0.0.1:8787)
+ccm-server serve | config
 ccm-server admin status
-ccm-server admin invite create --label alice --ttl-hours 24
-ccm-server admin invite list
-ccm-server admin user list | create --label x | enable 3 | disable 3
-ccm-server admin user policy 3 --allow claude-sonnet-4-5 --rpm 10 --daily-tokens 2000000
-ccm-server admin key issue 3 | revoke 7
 ccm-server admin account list
-ccm-server admin account set 2 --priority 10 --weight 3 --group team --clear-cooldown
-ccm-server admin user policy 3 --group team         # bind a terminal to an account group
+ccm-server admin account login [--label x --group g]
+ccm-server admin account import --file ~/.claude/.credentials.json | --from-keychain
+ccm-server admin account set 2 --priority 10 --weight 3 --group team --proxy socks5://127.0.0.1:1080 --clear-cooldown
+ccm-server admin account refresh 2 | pin 2 | delete 2
+ccm-server admin invite create --label alice --ttl-hours 24 | list | delete <hash>
+ccm-server admin user list | create --label x | enable 3 | disable 3
+ccm-server admin user policy 3 --allow claude-sonnet-4-5 --rpm 10 --daily-tokens 2000000 --group team
+ccm-server admin key issue 3 | revoke 7
 ccm-server admin models list | disable claude-opus-4-1 | refresh
+ccm-server admin models routes 're:^gpt-4=claude-sonnet-4-5' 'gpt-3.5-turbo=claude-haiku-4-5'
 ccm-server admin stats --days 7
 ccm-server admin usage --status error --page-size 20
-ccm-server admin reset-token [--token my-secret]   # writes the local DB directly
-
-# Effort tiers
-ccm-server effort list
-ccm-server effort expand --tier high
-echo '{"model":"x","effort":"medium"}' | ccm-server effort expand
-```
-
-**Lost the admin token?** Run `ccm-server admin reset-token` on the host (a
-running server picks the new token up within a minute), or pin one with
-`admin.initial_token` / `CCM_ADMIN_TOKEN`, which is installed on every start.
-
-## Migrating from the Go cliproxy
-
-```sh
+ccm-server admin reset-token [--token my-secret]      # local DB, no server needed
+ccm-server effort list | expand --tier high
 ccm-server migrate-from-go --go-data-dir ~/.local/share/cliproxy
 ```
 
-Copies users, API keys, invites, policies, the admin token, the model
-denylist and usage history into a fresh CC Manager data dir, keeping ids —
-existing `sk-cp-…` keys and the admin token keep working. Upstream accounts
-are decrypted with the Go `secret.key` (or `--go-secret-key`) and re-sealed.
-
-## Multiple accounts
-
-Every enabled account is a candidate. For each request CC Manager:
-
-1. Keeps only accounts in the user's group (`account_group` in the user's
-   policy; unset means every account), that are `active`, and that aren't
-   cooling down.
-2. Reuses the session's sticky account if it is still healthy. The session
-   is Claude Code's `metadata.user_id`, else the terminal key. This keeps
-   Anthropic's prompt cache hitting.
-3. Otherwise applies `pool.strategy`: `priority` (highest `priority`, then
-   oldest), `round_robin` (smooth, weighted by `weight`), or `least_used`
-   (fewest tokens in the last 5 hours).
-
-Before any byte reaches the client, a failed attempt moves on to another
-account, up to `pool.max_retries` extra attempts:
-
-| Upstream result          | Action                                                         |
-| ------------------------ | -------------------------------------------------------------- |
-| 429                      | Cool the account down until `retry-after` / `anthropic-ratelimit-*-reset` (else `pool.cooldown_secs`), try the next. |
-| 401                      | Force a token refresh (or mark `needs_reauth` without a refresh token), try the next. |
-| 403                      | Cool down 30 minutes, try the next.                            |
-| 500 / 502 / 503 / 504 / 529, network error | Try the next, no cooldown.                   |
-| anything else            | Forward as is.                                                 |
-
-When the accounts run out, the last upstream response is forwarded verbatim.
-If every eligible account is already cooling, the proxy answers 429
-`rate_limit_error` with a `retry-after` for the earliest one, without calling
-upstream. Cooldowns are stored in the database and survive restarts. Each
-failed attempt is recorded in usage with a `failover: …` error.
+Admin subcommands use `CCM_ADMIN_TOKEN` and `CCM_ADMIN_URL`
+(default `http://127.0.0.1:8787`).
 
 ## Operating notes
 
-- **Claude Code as client.** `/v1/models` is served from CC Manager's own
-  catalog (refreshed every 30 minutes). The inbound `anthropic-beta` is
-  merged with the configured flags. The inbound `User-Agent` is forwarded
-  only when it starts with `claude-cli/`, `claude-code/`, `anthropic-` or
-  `claude/`; others get the configured default.
-- **Effort tiers.** `/v1/messages` accepts a top-level `"effort"` that fills
-  in `max_tokens` and extended thinking. It is stripped before forwarding;
-  explicit `max_tokens` / `thinking` always win; unknown tiers get a 400.
-
-  | tier   | max_tokens | thinking budget |
-  | ------ | ---------- | --------------- |
-  | auto   | 8192       | —               |
-  | low    | 4096       | —               |
-  | medium | 16384      | 5000            |
-  | high   | 32768      | 15000           |
-  | xhigh  | 48000      | 30000           |
-  | max    | 64000      | 60000           |
-
+- **Effort tiers.** A top-level `"effort"` fills in `max_tokens` and
+  extended thinking (auto 8192 · low 4096 · medium 16384 + 5000 ·
+  high 32768 + 15000 · xhigh 48000 + 30000 · max 64000 + 60000); explicit
+  values win; unknown tiers get a 400.
 - **System-prompt injection.** The OAuth Pro/Max endpoint requires
   `You are Claude Code, Anthropic's official CLI for Claude.` as the first
-  system block and otherwise answers with a misleading
-  `rate_limit_error: "Error"`. CC Manager prepends it when missing; requests
-  that already have it pass through byte-for-byte. Disable with
-  `upstream.inject_claude_code_system: false`.
-- **Upstream errors** are forwarded byte-for-byte with status and headers
-  (`retry-after`, `anthropic-ratelimit-*`). A summary with type, message and
-  `request_id` is logged and stored in `usage_events.error`.
-- **OAuth refresh** happens in-process within 60 s of expiry. A rejected
-  refresh token marks the account `needs_reauth`.
+  system block and otherwise answers a misleading `rate_limit_error`. It is
+  prepended when missing; disable with `upstream.inject_claude_code_system`.
+- **Headers.** The inbound `anthropic-beta` is merged with the configured
+  flags; the inbound `User-Agent` is forwarded only for `claude-cli/`,
+  `claude-code/`, `anthropic-` and `claude/` clients.
+- **Upstream errors** are forwarded byte-for-byte with status and headers; a
+  summary with `request_id` is logged and stored in usage.
+- **Metrics.** `/metrics` exposes request and token counters per account and
+  status, account up/cooldown gauges and quota utilization. Scrape it with the
+  admin token as a bearer token.
 - **Backups.** Back up `data_dir` (`cc-manager.db` + `secret.key`).
+- **Migrating from the Go cliproxy**: `ccm-server migrate-from-go` copies
+  users, keys, invites, policies, the admin token and usage history into a
+  fresh data dir, keeping ids so existing keys keep working.
 
 ## Development
 
 ```sh
+pnpm install && pnpm build          # UI (embedded into ccm-server at build time)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-pnpm install && pnpm build
+cargo run -p ccm-server -- serve    # headless
+pnpm tauri dev                      # desktop; `pnpm tauri build` for installers
 ```
+
+Linux desktop builds need `libwebkit2gtk-4.1-dev`,
+`libayatana-appindicator3-dev` and `librsvg2-dev`. Pushing a `v*` tag runs
+the release workflow (installers for all platforms, `ccm-server` binaries,
+`ghcr.io` image) into a draft release.

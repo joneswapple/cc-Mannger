@@ -33,7 +33,7 @@ export function Button({
   return (
     <button
       {...props}
-      className={`rounded-md ${small ? "px-2 py-1 text-xs" : "px-3 py-1.5 text-sm"} font-medium disabled:opacity-50 ${toneClass[tone]} ${className}`}
+      className={`shrink-0 whitespace-nowrap rounded-md ${small ? "px-2 py-1 text-xs" : "px-3 py-1.5 text-sm"} font-medium disabled:opacity-50 ${toneClass[tone]} ${className}`}
     />
   );
 }
@@ -59,8 +59,10 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   );
 }
 
-export const inputClass =
-  "w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950";
+/// Input styling without a width, for inputs sized by their container.
+export const inputBase =
+  "rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950";
+export const inputClass = `w-full ${inputBase}`;
 
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   useEffect(() => {

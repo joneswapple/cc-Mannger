@@ -26,7 +26,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "appimage", "deb", "dmg"],
+    "targets": [
+      "nsis",
+      "appimage",
+      "deb",
+      "dmg"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -36,10 +41,16 @@
     ],
     "windows": {
       "nsis": {
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "displayLanguageSelector": true,
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "./windows/hooks.nsh"
       }
-    }
+    },
+    "category": "DeveloperTool",
+    "shortDescription": "Share Claude Pro/Max accounts with your terminals"
   }
 }
