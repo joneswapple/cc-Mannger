@@ -56,8 +56,12 @@ jobs:
           - platform: windows-latest # NSIS installer
             args: ""
           - platform: macos-latest # dmg (Apple Silicon)
+            target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-          - platform: macos-13 # dmg (Intel)
+          # dmg (Intel), cross-compiled: GitHub retired the macOS 13 image,
+          # the last Intel one.
+          - platform: macos-latest
+            target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
           - platform: ubuntu-22.04 # AppImage + deb
             args: ""
@@ -76,7 +80,11 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,7 +104,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest # Intel, cross-compiled (no macOS 13 image)
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -114,6 +122,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - run: cargo build --release --locked -p ccm-server --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
