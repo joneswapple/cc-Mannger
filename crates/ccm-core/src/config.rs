@@ -85,6 +85,13 @@ pub struct UpstreamConfig {
     /// the defaults match the public Claude Code CLI.
     pub oauth_token_url: String,
     pub oauth_client_id: String,
+    /// PKCE login: where the browser is sent, where it comes back (the
+    /// default console page shows a `code#state` to paste), and the scopes.
+    pub oauth_authorize_url: String,
+    pub oauth_redirect_uri: String,
+    pub oauth_scopes: String,
+    /// Account profile (email / organization / plan) for a bearer token.
+    pub profile_url: String,
     pub anthropic_beta: String,
     pub user_agent: String,
     /// Prepend the literal Claude Code system block when missing — required
@@ -159,6 +166,10 @@ impl Default for UpstreamConfig {
             credentials_path: String::new(),
             oauth_token_url: "https://console.anthropic.com/v1/oauth/token".into(),
             oauth_client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
+            oauth_authorize_url: "https://claude.ai/oauth/authorize".into(),
+            oauth_redirect_uri: "https://console.anthropic.com/oauth/code/callback".into(),
+            oauth_scopes: "org:create_api_key user:profile user:inference".into(),
+            profile_url: "https://api.anthropic.com/api/oauth/profile".into(),
             // Both betas are required for OAuth-bearer /v1/messages calls.
             anthropic_beta: "claude-code-20250219,oauth-2025-04-20".into(),
             user_agent: "claude-cli/1.0 (cc-manager)".into(),

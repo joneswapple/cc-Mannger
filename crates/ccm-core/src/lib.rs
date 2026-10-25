@@ -6,7 +6,9 @@ pub mod auth;
 pub mod capture;
 pub mod config;
 pub mod http;
+pub mod login;
 pub mod oauth;
+mod onboard;
 pub mod policy;
 pub mod pool;
 pub mod provider;
@@ -23,6 +25,7 @@ use anyhow::{Context, Result};
 use crate::accounts::AccountStore;
 use crate::auth::{Admin, Invites, Keys};
 use crate::config::Config;
+use crate::login::LoginManager;
 use crate::oauth::OAuthClient;
 use crate::policy::Engine;
 use crate::pool::AccountPool;
@@ -47,6 +50,9 @@ pub struct Core {
     pub recorder: Recorder,
     pub upstream: Upstream,
     pub catalog: Catalog,
+    pub login: LoginManager,
+    /// Guards [`Core::start_background`].
+    background: Arc<std::sync::Once>,
 }
 
 /// What [`Core::open`] did on the way up, for the caller to report.
@@ -89,6 +95,8 @@ impl Core {
                 policy: Engine::new(store.clone()),
                 recorder: Recorder::new(store.clone()),
                 catalog: Catalog::new(upstream.clone()),
+                login: LoginManager::new(&config.upstream),
+                background: Arc::new(std::sync::Once::new()),
                 upstream,
                 config: Arc::new(config),
                 store,

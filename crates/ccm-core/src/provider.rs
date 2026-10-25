@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::accounts::{Account, AccountStore, Credentials, STATUS_ACTIVE, STATUS_NEEDS_REAUTH};
@@ -22,6 +22,9 @@ pub struct AccountProvider {
     id: i64,
     label: String,
     pub(crate) sync_path: Option<PathBuf>,
+    /// Outbound proxy for this account ("" = direct). Token refreshes and
+    /// upstream calls both go through it; there is no direct fallback.
+    pub(crate) proxy_url: String,
     state: AsyncMutex<State>,
 }
 
@@ -32,15 +35,46 @@ struct State {
 }
 
 impl AccountProvider {
-    pub fn new(store: AccountStore, oauth: OAuthClient, a: &Account) -> Self {
-        Self {
+    pub fn new(store: AccountStore, oauth: OAuthClient, a: &Account) -> Result<Self> {
+        let oauth = if a.proxy_url.is_empty() {
+            oauth
+        } else {
+            oauth
+                .with_proxy(&a.proxy_url)
+                .with_context(|| format!("account #{} proxy", a.id))?
+        };
+        Ok(Self {
             store,
             oauth,
             id: a.id,
             label: a.label.clone(),
             sync_path: (a.sync_file && !a.source_path.is_empty())
                 .then(|| a.source_path.clone().into()),
+            proxy_url: a.proxy_url.clone(),
             state: AsyncMutex::new(State::default()),
+        })
+    }
+
+    /// Refreshes the token now, whatever its expiry (admin "refresh").
+    pub async fn force_refresh(&self) -> Result<()> {
+        let mut st = self.state.lock().await;
+        let cur = match st.creds.take() {
+            Some(c) => self.adopt_file(c)?,
+            None => self.load()?,
+        };
+        if cur.refresh_token.is_empty() {
+            st.creds = Some(cur);
+            bail!("account #{} has no refresh token; log in again", self.id);
+        }
+        match self.refresh(&cur).await {
+            Ok(next) => {
+                st.creds = Some(next);
+                Ok(())
+            }
+            Err(e) => {
+                st.creds = Some(cur);
+                Err(e)
+            }
         }
     }
 
@@ -298,7 +332,8 @@ mod tests {
             &creds("old", "file-refresh", crate::now_millis() - 1000),
         );
         let id = import_cli_credentials(&s, &path, true).unwrap().unwrap();
-        let p = AccountProvider::new(s.clone(), OAuthClient::new(url, "cli"), &s.get(id).unwrap());
+        let p = AccountProvider::new(s.clone(), OAuthClient::new(url, "cli"), &s.get(id).unwrap())
+            .unwrap();
 
         assert_eq!(p.token().await.unwrap(), "new-access");
         assert_eq!(p.token().await.unwrap(), "new-access");
@@ -326,7 +361,8 @@ mod tests {
             &creds("old", "old-refresh", crate::now_millis() - 1000),
         );
         let id = import_cli_credentials(&s, &path, true).unwrap().unwrap();
-        let p = AccountProvider::new(s.clone(), OAuthClient::new(url, "cli"), &s.get(id).unwrap());
+        let p = AccountProvider::new(s.clone(), OAuthClient::new(url, "cli"), &s.get(id).unwrap())
+            .unwrap();
         assert!(p.token().await.is_err());
         // The host's `claude` logs in again and rewrites the file.
         write_file(
@@ -356,7 +392,8 @@ mod tests {
                 &creds("a", "r", crate::now_millis() - 1000),
             )
             .unwrap();
-        let p = AccountProvider::new(s.clone(), OAuthClient::new(url, "cli"), &s.get(id).unwrap());
+        let p = AccountProvider::new(s.clone(), OAuthClient::new(url, "cli"), &s.get(id).unwrap())
+            .unwrap();
         assert!(p.token().await.is_err());
         assert_eq!(s.get(id).unwrap().status, STATUS_NEEDS_REAUTH);
     }
@@ -378,7 +415,8 @@ mod tests {
             s.clone(),
             OAuthClient::new("http://unused", "cli"),
             &s.get(id).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(p.token().await.unwrap(), "stale");
     }
 }

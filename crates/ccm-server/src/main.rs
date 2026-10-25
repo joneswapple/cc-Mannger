@@ -3,6 +3,7 @@
 
 mod admin;
 mod migrate;
+mod ui;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -130,7 +131,7 @@ async fn serve(cfg: Config) -> Result<()> {
         }
     }
     println!("upstream credentials: {}", core.pool.source());
-    ccm_core::http::serve(core, async {
+    ccm_core::http::serve_with(core, ui::router(), async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await

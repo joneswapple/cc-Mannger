@@ -52,6 +52,7 @@ pub fn router(core: Core) -> Router {
         .route("/v1/messages/count_tokens", post(proxy::count_tokens))
         .route("/v1/models", get(proxy::models))
         .route("/register", post(admin::register))
+        .route("/oauth/callback", get(admin::oauth_callback))
         .route("/healthz", get(healthz))
         .nest("/admin/api", admin::routes())
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -59,19 +60,77 @@ pub fn router(core: Core) -> Router {
         .with_state(core)
 }
 
-/// Binds `core.config.listen`, starts the model catalog refresher, and
-/// serves until `shutdown` resolves.
+/// Binds `core.config.listen`, starts the background refreshers, and serves
+/// until `shutdown` resolves.
 pub async fn serve(core: Core, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+    serve_with(core, Router::new(), shutdown).await
+}
+
+/// [`serve`] with extra routes merged in (e.g. the embedded web UI).
+pub async fn serve_with(
+    core: Core,
+    extra: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let listen = core.config.listen.clone();
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
-    core.catalog.start(CATALOG_REFRESH);
+    core.start_background();
     tracing::info!("cc-manager listening on {listen}");
-    axum::serve(listener, router(core))
+    axum::serve(listener, router(core).merge(extra))
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
+}
+
+impl Core {
+    /// Starts periodic jobs (model catalog). Must run inside a Tokio
+    /// runtime; repeated calls start nothing new.
+    pub fn start_background(&self) {
+        self.background
+            .call_once(|| self.catalog.start(CATALOG_REFRESH));
+    }
+}
+
+/// Request extension marking an in-process call (the desktop UI bridge).
+/// It can only be attached by code in this process, never by a network
+/// client, and satisfies [`AdminAuth`].
+#[derive(Clone, Copy)]
+pub struct TrustedLocal;
+
+/// Runs one admin API request in-process, as the desktop app's UI bridge:
+/// same routes and behaviour as over HTTP, without a token. Returns the
+/// status and the JSON body (`null` when empty).
+pub async fn call_local(
+    app: &Router,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(u16, serde_json::Value)> {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    if !path.starts_with("/admin/api/") {
+        anyhow::bail!("only /admin/api/* is reachable through the local bridge");
+    }
+    let mut req = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            body.map(|b| b.to_string()).unwrap_or_default(),
+        ))?;
+    req.extensions_mut().insert(TrustedLocal);
+    let resp = app.clone().oneshot(req).await?;
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await?.to_bytes();
+    let value = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()))
+    };
+    Ok((status, value))
 }
 
 /// Liveness only; details live behind the admin API.
@@ -189,6 +248,9 @@ impl FromRequestParts<Core> for AdminAuth {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, core: &Core) -> Result<Self, Response> {
+        if parts.extensions.get::<TrustedLocal>().is_some() {
+            return Ok(AdminAuth);
+        }
         let token = cookie(&parts.headers, "ccm_admin")
             .or_else(|| bearer(&parts.headers))
             .or_else(|| header(&parts.headers, "x-admin-token"))

@@ -55,6 +55,8 @@ pub struct AccountPatch {
     pub weight: Option<i64>,
     pub enabled: Option<bool>,
     pub account_group: Option<String>,
+    /// Outbound HTTP / SOCKS5 proxy for this account; empty string removes it.
+    pub proxy_url: Option<String>,
     /// `true` lifts an active cooldown.
     #[serde(default)]
     pub clear_cooldown: bool,
@@ -108,6 +110,19 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Account> {
 
 /// access_token_enc, refresh_token_enc, expires_at, scopes
 type SecretRow = (Vec<u8>, Option<Vec<u8>>, i64, String);
+
+/// Accepts `http(s)://` and `socks5(h)://` proxy URLs; empty clears.
+pub fn validate_proxy_url(s: &str) -> Result<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    let url = reqwest::Url::parse(s).with_context(|| format!("invalid proxy url {s:?}"))?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h") || url.host().is_none() {
+        bail!("proxy url must be http://, https://, socks5:// or socks5h:// with a host");
+    }
+    Ok(s.to_string())
+}
 
 fn aad(id: i64, field: &str) -> Vec<u8> {
     format!("account:{id}:{field}").into_bytes()
@@ -234,6 +249,9 @@ impl AccountStore {
         if let Some(g) = &p.account_group {
             a.account_group = g.trim().to_string();
         }
+        if let Some(proxy) = &p.proxy_url {
+            a.proxy_url = validate_proxy_url(proxy)?;
+        }
         if p.clear_cooldown {
             a.cooldown_until = 0;
             // The reason belonged to the cooldown; a needs_reauth reason stays.
@@ -243,8 +261,9 @@ impl AccountStore {
         }
         self.exec(
             "UPDATE accounts SET label = ?1, priority = ?2, weight = ?3, enabled = ?4,
-                account_group = ?5, cooldown_until = ?6, status_reason = ?7, updated_at = ?8
-             WHERE id = ?9",
+                account_group = ?5, cooldown_until = ?6, status_reason = ?7, proxy_url = ?8,
+                updated_at = ?9
+             WHERE id = ?10",
             params![
                 a.label,
                 a.priority,
@@ -253,11 +272,59 @@ impl AccountStore {
                 a.account_group,
                 a.cooldown_until,
                 a.status_reason,
+                a.proxy_url,
                 crate::now_unix(),
                 id
             ],
         )?;
         self.get(id)
+    }
+
+    /// The account already holding this email, if any (re-logins update it
+    /// instead of adding a duplicate).
+    pub fn find_by_email(&self, email: &str) -> Result<Option<Account>> {
+        if email.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .store
+            .conn()
+            .query_row(
+                &format!("SELECT {COLS} FROM accounts WHERE email = ?1 ORDER BY id LIMIT 1"),
+                [email],
+                from_row,
+            )
+            .optional()?)
+    }
+
+    /// Records what the profile endpoint said; empty values keep the old one.
+    pub fn set_profile(&self, id: i64, email: &str, org_uuid: &str, plan: &str) -> Result<()> {
+        self.exec(
+            "UPDATE accounts SET
+                email = CASE WHEN ?1 = '' THEN email ELSE ?1 END,
+                org_uuid = CASE WHEN ?2 = '' THEN org_uuid ELSE ?2 END,
+                plan = CASE WHEN ?3 = '' THEN plan ELSE ?3 END,
+                updated_at = ?4
+             WHERE id = ?5",
+            params![email, org_uuid, plan, crate::now_unix(), id],
+        )
+    }
+
+    /// One above the current highest priority, so `priority` scheduling
+    /// prefers this account ("pin to top").
+    pub fn pin(&self, id: i64) -> Result<Account> {
+        let top: i64 = self.store.conn().query_row(
+            "SELECT COALESCE(MAX(priority), 0) FROM accounts WHERE id != ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        self.update(
+            id,
+            &AccountPatch {
+                priority: Some(top + 1),
+                ..Default::default()
+            },
+        )
     }
 
     /// Input + output tokens per account since `since` (unix seconds).

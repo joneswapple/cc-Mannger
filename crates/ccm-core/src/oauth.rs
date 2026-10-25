@@ -173,6 +173,14 @@ impl OAuthClient {
         }
     }
 
+    /// The same endpoint reached through an HTTP / SOCKS5 proxy.
+    pub fn with_proxy(&self, proxy_url: &str) -> Result<Self> {
+        Ok(Self {
+            http: proxied_client(proxy_url, Some(Duration::from_secs(30)))?,
+            ..self.clone()
+        })
+    }
+
     /// Exchanges `cur.refresh_token` for a new token set. Scopes, and the
     /// refresh token when the endpoint doesn't rotate it, carry over.
     pub async fn refresh(&self, cur: &Credentials) -> Result<Credentials> {
@@ -214,6 +222,18 @@ impl OAuthClient {
             scopes: cur.scopes.clone(),
         })
     }
+}
+
+/// A reqwest client that sends everything through `proxy_url` (never
+/// directly). `timeout` is the overall request timeout, if any.
+pub fn proxied_client(proxy_url: &str, timeout: Option<Duration>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(proxy_url).with_context(|| format!("proxy {proxy_url:?}"))?)
+        .connect_timeout(Duration::from_secs(30));
+    if let Some(t) = timeout {
+        b = b.timeout(t);
+    }
+    Ok(b.build()?)
 }
 
 /// Whether a refresh error means the refresh token itself was rejected.

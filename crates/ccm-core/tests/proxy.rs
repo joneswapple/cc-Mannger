@@ -48,6 +48,37 @@ async fn fake_handler(
         headers: headers.clone(),
         body: body.to_vec(),
     });
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+    if uri.path() == "/oauth/token" {
+        let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+        let resp = match req["grant_type"].as_str() {
+            Some("authorization_code") if req["code"] == "good-code" => json!({
+                "access_token": "login-access", "refresh_token": "login-refresh", "expires_in": 3600,
+                "scope": "user:inference user:profile",
+                "account": {"email_address": "new@x.io"}, "organization": {"uuid": "org-new"}
+            }),
+            Some("refresh_token") => json!({
+                "access_token": format!("refreshed-{}", req["refresh_token"].as_str().unwrap_or_default()),
+                "expires_in": 3600
+            }),
+            _ => return (StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#).into_response(),
+        };
+        return axum::Json(resp).into_response();
+    }
+    if uri.path() == "/api/oauth/profile" {
+        // The email is derived from the token so tests can steer it.
+        let email = bearer.split('-').next().unwrap_or_default();
+        return axum::Json(json!({
+            "account": {"email": format!("{email}@x.io"), "has_claude_max": true},
+            "organization": {"uuid": format!("org-{email}")}
+        }))
+        .into_response();
+    }
     if uri.path() == "/v1/models" {
         return (
             [("content-type", "application/json")],
@@ -131,6 +162,8 @@ async fn harness() -> Harness {
     };
     cfg.upstream.credentials_path = creds.to_string_lossy().into_owned();
     cfg.upstream.base_url = format!("http://{addr}");
+    cfg.upstream.oauth_token_url = format!("http://{addr}/oauth/token");
+    cfg.upstream.profile_url = format!("http://{addr}/api/oauth/profile");
     cfg.upstream.user_agent = "test-ua".into();
     cfg.upstream.anthropic_beta = "test-beta".into();
     let (core, startup) = Core::open(cfg).unwrap();
@@ -907,4 +940,256 @@ fn ccm_core_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+#[tokio::test]
+async fn oauth_login_adds_then_updates_account() {
+    let h = harness().await;
+    let (status, start) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/oauth/start",
+            Some(json!({"label": "via-login", "account_group": "g1"})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let url = start["url"].as_str().unwrap();
+    assert!(
+        url.starts_with("https://claude.ai/oauth/authorize?"),
+        "{url}"
+    );
+    assert!(url.contains("code_challenge_method=S256"));
+    let state = start["state"].as_str().unwrap();
+
+    let (status, a) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/oauth/complete",
+            Some(json!({"code": format!("good-code#{state}")})),
+        )
+        .await;
+    assert_eq!(status, 200, "{a}");
+    assert_eq!(
+        (
+            a["label"].as_str(),
+            a["email"].as_str(),
+            a["account_group"].as_str()
+        ),
+        (Some("via-login"), Some("new@x.io"), Some("g1"))
+    );
+    let id = a["id"].as_i64().unwrap();
+    assert_eq!(
+        h.core.accounts.load_credentials(id).unwrap().access_token,
+        "login-access"
+    );
+
+    // Replaying the state fails; a fresh login for the same email updates
+    // the account instead of adding one.
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/oauth/complete",
+            Some(json!({"code": format!("good-code#{state}")})),
+        )
+        .await;
+    assert_eq!(status, 400);
+    h.core.accounts.set_status(id, "needs_reauth", "x").unwrap();
+    let (_, start2) = h
+        .admin("POST", "/admin/api/accounts/oauth/start", None)
+        .await;
+    let (_, a2) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/oauth/complete",
+            Some(json!({"code": "good-code", "state": start2["state"]})),
+        )
+        .await;
+    assert_eq!(a2["id"].as_i64(), Some(id));
+    assert_eq!(a2["status"], "active");
+    assert_eq!(h.core.accounts.count().unwrap(), 2);
+
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/oauth/complete",
+            Some(json!({"code": "bad-code#nope"})),
+        )
+        .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn oauth_callback_completes_login_publicly() {
+    let h = harness().await;
+    let start = h.core.login.start(Default::default());
+    let req = Request::get(format!(
+        "/oauth/callback?code=good-code&state={}",
+        start.state
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, headers, body) = h.call(req).await;
+    assert_eq!(status, 200);
+    assert!(hdr(&headers, "content-type").starts_with("text/html"));
+    assert!(String::from_utf8_lossy(&body).contains("new@x.io"));
+    let req = Request::get("/oauth/callback?code=good-code&state=forged")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.call(req).await.0, 400);
+}
+
+#[tokio::test]
+async fn import_single_batch_and_dedup_by_email() {
+    let h = harness().await;
+    let doc = json!({"claudeAiOauth": {"accessToken": "bob-1", "refreshToken": "r", "expiresAt": 9_999_999_999_999i64}});
+    let (status, r) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/import",
+            Some(json!({"credentials": doc, "label": "bob"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{r}");
+    let bob = &r["imported"][0];
+    assert_eq!(
+        (
+            bob["label"].as_str(),
+            bob["email"].as_str(),
+            bob["plan"].as_str()
+        ),
+        (Some("bob"), Some("bob@x.io"), Some("claude_max"))
+    );
+
+    let batch = json!([
+        {"access_token": "carol-1", "refresh_token": "r", "expires_in": 3600},
+        {"label": "bob again", "credentials": {"accessToken": "bob-2"}},
+        {"nonsense": true}
+    ]);
+    let (status, r) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/import",
+            Some(json!({"credentials": batch})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(r["imported"].as_array().unwrap().len(), 2);
+    assert_eq!(r["errors"][0]["index"], 2);
+    // bob's second import updated the existing account.
+    assert_eq!(r["imported"][1]["id"], bob["id"]);
+    let bob_id = bob["id"].as_i64().unwrap();
+    assert_eq!(
+        h.core
+            .accounts
+            .load_credentials(bob_id)
+            .unwrap()
+            .access_token,
+        "bob-2"
+    );
+    assert_eq!(h.core.accounts.count().unwrap(), 3);
+
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/admin/api/accounts/import",
+            Some(json!({"credentials": {"x": 1}})),
+        )
+        .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn refresh_pin_proxy_and_delete() {
+    let h = harness().await;
+    let id = h.add_account("ops", "ops-tok", 0, "");
+    h.core
+        .accounts
+        .save_credentials(
+            id,
+            &Credentials {
+                access_token: "ops-tok".into(),
+                refresh_token: "ops-ref".into(),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+            },
+        )
+        .unwrap();
+
+    let (status, a) = h
+        .admin("POST", &format!("/admin/api/accounts/{id}/refresh"), None)
+        .await;
+    assert_eq!(status, 200, "{a}");
+    assert_eq!(
+        h.core.accounts.load_credentials(id).unwrap().access_token,
+        "refreshed-ops-ref"
+    );
+    // The profile is re-read with the new token.
+    assert_eq!(a["email"], "refreshed@x.io");
+    // Upstream calls use the refreshed token right away.
+    let (_, pinned) = h
+        .admin("POST", &format!("/admin/api/accounts/{id}/pin"), None)
+        .await;
+    assert!(pinned["priority"].as_i64().unwrap() > 0);
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(h.tokens_seen().last().unwrap(), "refreshed-ops-ref");
+
+    let (status, e) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/accounts/{id}"),
+            Some(json!({"proxy_url": "ftp://x"})),
+        )
+        .await;
+    assert_eq!(status, 400, "{e}");
+    let (status, a) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/accounts/{id}"),
+            Some(json!({"proxy_url": "socks5://127.0.0.1:1"})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(a["proxy_url"], "socks5://127.0.0.1:1");
+    // A dead proxy fails that account over; it never goes direct.
+    let (status, _, _) = h
+        .messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(h.tokens_seen().last().unwrap(), "upstream-access");
+
+    let (status, _) = h
+        .admin("POST", &format!("/admin/api/accounts/{id}/delete"), None)
+        .await;
+    assert_eq!(status, 204);
+    assert_eq!(
+        h.admin("POST", &format!("/admin/api/accounts/{id}/delete"), None)
+            .await
+            .0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn local_bridge_needs_no_token_but_only_reaches_admin_api() {
+    let h = harness().await;
+    let (status, body) = ccm_core::http::call_local(&h.app, "GET", "/admin/api/status", None)
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    let (status, _) = ccm_core::http::call_local(
+        &h.app,
+        "POST",
+        "/admin/api/users",
+        Some(json!({"label": "x"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+    assert!(
+        ccm_core::http::call_local(&h.app, "POST", "/v1/messages", None)
+            .await
+            .is_err()
+    );
 }

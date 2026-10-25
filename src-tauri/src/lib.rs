@@ -1,16 +1,48 @@
 //! CC Manager desktop shell: runs the ccm-core proxy in-process, shows the
 //! React UI, and lives in the system tray.
 
-use ccm_core::{config::Config, http::Status, Core};
+use ccm_core::{config::Config, Core};
+use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, State, WindowEvent,
 };
+use tauri_plugin_opener::OpenerExt;
 
+/// In-process admin API router, shared by every UI call.
+struct Bridge(axum::Router);
+
+#[derive(Serialize)]
+struct BridgeResponse {
+    status: u16,
+    body: serde_json::Value,
+}
+
+/// The UI's single entry point: runs an `/admin/api/*` request against the
+/// in-process router (same handlers as over HTTP, no token).
 #[tauri::command]
-fn core_status(core: State<'_, Core>) -> Result<Status, String> {
-    core.status().map_err(|e| format!("{e:#}"))
+async fn admin_request(
+    bridge: State<'_, Bridge>,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<BridgeResponse, String> {
+    let (status, body) = ccm_core::http::call_local(&bridge.0, &method, &path, body)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(BridgeResponse { status, body })
+}
+
+/// Opens an http(s) URL (the OAuth authorize page) in the system browser.
+#[tauri::command]
+fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) URLs can be opened".into());
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 fn show_main(app: &AppHandle) {
@@ -43,6 +75,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             tracing::error!("proxy server stopped: {e:#}");
         }
     });
+    app.manage(Bridge(ccm_core::http::router(core.clone())));
     app.manage(core);
 
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
@@ -84,6 +117,7 @@ pub fn run() {
         )
         .init();
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(setup)
         .on_window_event(|window, event| {
             // Closing the window keeps the proxy running in the tray.
@@ -92,7 +126,7 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![core_status])
+        .invoke_handler(tauri::generate_handler![admin_request, open_url])
         .run(tauri::generate_context!())
         .expect("error while running CC Manager");
 }

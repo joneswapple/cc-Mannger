@@ -100,7 +100,7 @@ impl AccountPool {
                 return Err(AllCooling { retry_after }.into());
             }
             return match eligible.first() {
-                Some(a) => Ok(self.provider(a)),
+                Some(a) => self.provider(a),
                 None => Err(NoAccount.into()),
             };
         }
@@ -112,7 +112,7 @@ impl AccountPool {
         if let Some(key) = &sticky_key {
             if let Some(id) = self.sticky_lookup(key) {
                 if let Some(a) = healthy.iter().find(|a| a.id == id) {
-                    return Ok(self.provider(a));
+                    return self.provider(a);
                 }
             }
         }
@@ -124,7 +124,7 @@ impl AccountPool {
         if let Some(key) = sticky_key {
             self.sticky_bind(key, chosen.id);
         }
-        Ok(self.provider(chosen))
+        self.provider(chosen)
     }
 
     fn sticky_lookup(&self, key: &str) -> Option<i64> {
@@ -184,23 +184,37 @@ impl AccountPool {
     }
 
     /// Cached per account so the in-memory token survives across requests;
-    /// rebuilt when the account's sync settings change.
-    fn provider(&self, a: &Account) -> Arc<AccountProvider> {
+    /// rebuilt when the account's sync or proxy settings change.
+    fn provider(&self, a: &Account) -> Result<Arc<AccountProvider>> {
         let mut map = self.providers.lock().unwrap_or_else(|e| e.into_inner());
         let want: Option<std::path::PathBuf> =
             (a.sync_file && !a.source_path.is_empty()).then(|| a.source_path.clone().into());
         if let Some(p) = map.get(&a.id) {
-            if p.sync_path == want {
-                return p.clone();
+            if p.sync_path == want && p.proxy_url == a.proxy_url {
+                return Ok(p.clone());
             }
         }
         let p = Arc::new(AccountProvider::new(
             self.store.clone(),
             self.oauth.clone(),
             a,
-        ));
+        )?);
         map.insert(a.id, p.clone());
-        p
+        Ok(p)
+    }
+
+    /// The provider for a specific account, whatever its health.
+    pub fn provider_for(&self, id: i64) -> Result<Arc<AccountProvider>> {
+        self.provider(&self.store.get(id)?)
+    }
+
+    /// Drops the cached provider (and in-memory token) for an account, e.g.
+    /// after its credentials were replaced.
+    pub fn forget(&self, id: i64) {
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     }
 
     /// Parks an account for `secs` seconds (capped at a day).

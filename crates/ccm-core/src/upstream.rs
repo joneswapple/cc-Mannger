@@ -30,9 +30,25 @@ pub struct Upstream {
     user_agent: String,
     beta: String,
     pool: AccountPool,
+    /// One client per account proxy URL.
+    proxied: Arc<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>>,
 }
 
 impl Upstream {
+    /// The client for an account: direct, or through its proxy only.
+    fn client_for(&self, proxy_url: &str) -> Result<reqwest::Client> {
+        if proxy_url.is_empty() {
+            return Ok(self.http.clone());
+        }
+        let mut map = self.proxied.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = map.get(proxy_url) {
+            return Ok(c.clone());
+        }
+        let c = crate::oauth::proxied_client(proxy_url, None)?;
+        map.insert(proxy_url.to_string(), c.clone());
+        Ok(c)
+    }
+
     pub fn new(cfg: &UpstreamConfig, pool: AccountPool) -> Self {
         Self {
             // No overall timeout: responses stream for minutes. Cancellation
@@ -46,6 +62,7 @@ impl Upstream {
             user_agent: cfg.user_agent.clone(),
             beta: cfg.anthropic_beta.clone(),
             pool,
+            proxied: Default::default(),
         }
     }
 
@@ -164,7 +181,7 @@ impl Upstream {
             .await
             .map_err(|e| e.context("acquire upstream token"))?;
         let mut req = self
-            .http
+            .client_for(&provider.proxy_url)?
             .request(method, format!("{}{path}", self.base_url))
             .bearer_auth(token)
             .header("anthropic-version", "2023-06-01")

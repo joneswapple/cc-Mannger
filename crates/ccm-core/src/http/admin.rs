@@ -14,6 +14,7 @@ use serde_json::json;
 use super::{json_error, AdminAuth};
 use crate::accounts::{AccountPatch, NotFound};
 use crate::auth::InviteError;
+use crate::login::LoginIntent;
 use crate::policy::Policy;
 use crate::stats::SearchFilter;
 use crate::Core;
@@ -30,7 +31,13 @@ pub(super) fn routes() -> Router<Core> {
         .route("/invites", get(list_invites).post(create_invite))
         .route("/invites/:hash/delete", post(delete_invite))
         .route("/accounts", get(list_accounts))
+        .route("/accounts/oauth/start", post(oauth_start))
+        .route("/accounts/oauth/complete", post(oauth_complete))
+        .route("/accounts/import", post(import_accounts))
         .route("/accounts/:id", post(update_account))
+        .route("/accounts/:id/refresh", post(refresh_account))
+        .route("/accounts/:id/pin", post(pin_account))
+        .route("/accounts/:id/delete", post(delete_account))
         .route("/settings", get(settings))
         .route("/settings/disabled-models", post(set_disabled_models))
         .route("/settings/refresh-models", post(refresh_models))
@@ -224,6 +231,157 @@ async fn list_accounts(_: AdminAuth, State(core): State<Core>) -> ApiResult {
         "pool": core.pool.config(),
     }))
     .into_response())
+}
+
+fn account_error(e: anyhow::Error) -> Response {
+    if e.is::<NotFound>() {
+        json_error(StatusCode::NOT_FOUND, e)
+    } else {
+        json_error(StatusCode::BAD_REQUEST, format!("{e:#}"))
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct IntentRequest {
+    label: String,
+    account_group: String,
+}
+
+impl From<IntentRequest> for LoginIntent {
+    fn from(r: IntentRequest) -> Self {
+        LoginIntent {
+            label: r.label,
+            account_group: r.account_group,
+        }
+    }
+}
+
+/// Starts an OAuth login: open `url`, then post the shown `code#state` to
+/// `/accounts/oauth/complete` (or let the redirect hit `/oauth/callback`).
+async fn oauth_start(
+    _: AdminAuth,
+    State(core): State<Core>,
+    body: Option<Json<IntentRequest>>,
+) -> ApiResult {
+    let intent = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(core.login.start(intent.into())).into_response())
+}
+
+#[derive(Deserialize)]
+struct CompleteRequest {
+    code: String,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+async fn oauth_complete(
+    _: AdminAuth,
+    State(core): State<Core>,
+    Json(req): Json<CompleteRequest>,
+) -> ApiResult {
+    core.complete_login(&req.code, req.state.as_deref())
+        .await
+        .map(|a| Json(a).into_response())
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("{e:#}")))
+}
+
+#[derive(Deserialize)]
+struct ImportRequest {
+    /// One credentials document, or an array (see `Core::import_batch`).
+    credentials: serde_json::Value,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    account_group: String,
+}
+
+async fn import_accounts(
+    _: AdminAuth,
+    State(core): State<Core>,
+    Json(req): Json<ImportRequest>,
+) -> ApiResult {
+    let results = core
+        .import_batch(
+            &req.credentials,
+            LoginIntent {
+                label: req.label,
+                account_group: req.account_group,
+            },
+        )
+        .await;
+    let (mut imported, mut errors) = (vec![], vec![]);
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(a) => imported.push(a),
+            Err(e) => errors.push(json!({"index": i, "error": e})),
+        }
+    }
+    let status = if imported.is_empty() && !errors.is_empty() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(json!({"imported": imported, "errors": errors})),
+    )
+        .into_response())
+}
+
+async fn refresh_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<i64>) -> ApiResult {
+    core.refresh_account(id)
+        .await
+        .map(|a| Json(a).into_response())
+        .map_err(account_error)
+}
+
+async fn pin_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<i64>) -> ApiResult {
+    core.accounts
+        .pin(id)
+        .map(|a| Json(a).into_response())
+        .map_err(account_error)
+}
+
+async fn delete_account(_: AdminAuth, State(core): State<Core>, Path(id): Path<i64>) -> ApiResult {
+    core.accounts.delete(id).map_err(account_error)?;
+    core.pool.forget(id);
+    Ok(no_content())
+}
+
+/// Public: the OAuth redirect target when `oauth_redirect_uri` points here.
+/// The unguessable, single-use `state` is what authorizes it.
+pub(super) async fn oauth_callback(
+    State(core): State<Core>,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    let (status, msg) = match core.complete_login(&q.code, Some(&q.state)).await {
+        Ok(a) => (
+            StatusCode::OK,
+            format!("已添加账号：{}（{}）。可以关闭此页面。", a.label, a.email),
+        ),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("登录失败：{e:#}")),
+    };
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><title>CC Manager</title><p style=\"font:16px system-ui;margin:3em\">{}</p>",
+        html_escape(&msg)
+    );
+    (status, axum::response::Html(html)).into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct CallbackQuery {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn update_account(

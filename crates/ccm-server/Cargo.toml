@@ -7,10 +7,12 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 ccm-core.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+rust-embed = { version = "8", features = ["interpolate-folder-path", "mime-guess"] }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
