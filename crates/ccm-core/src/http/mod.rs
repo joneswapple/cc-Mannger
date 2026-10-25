@@ -88,8 +88,21 @@ impl Core {
     /// Starts periodic jobs (model catalog). Must run inside a Tokio
     /// runtime; repeated calls start nothing new.
     pub fn start_background(&self) {
-        self.background
-            .call_once(|| self.catalog.start(CATALOG_REFRESH));
+        self.background.call_once(|| {
+            self.catalog.start(CATALOG_REFRESH);
+            let url = self.config.upstream.usage_url.clone();
+            if !url.is_empty() {
+                let every = Duration::from_secs(self.config.upstream.usage_poll_secs.max(60));
+                let upstream = self.upstream.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(every);
+                    loop {
+                        tick.tick().await;
+                        upstream.probe_usage(&url).await;
+                    }
+                });
+            }
+        });
     }
 }
 

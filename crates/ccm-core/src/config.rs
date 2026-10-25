@@ -37,6 +37,9 @@ pub struct PoolConfig {
     pub max_retries: u32,
     /// Cooldown after a 429 when the upstream gives no reset time.
     pub cooldown_secs: u64,
+    /// Accounts whose 5h or 7d usage is at or above this fraction are only
+    /// used when no account below it is available.
+    pub quota_soft_limit: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +73,7 @@ impl Default for PoolConfig {
             sticky_ttl_secs: 3600,
             max_retries: 2,
             cooldown_secs: 60,
+            quota_soft_limit: 0.95,
         }
     }
 }
@@ -92,6 +96,11 @@ pub struct UpstreamConfig {
     pub oauth_scopes: String,
     /// Account profile (email / organization / plan) for a bearer token.
     pub profile_url: String,
+    /// Optional usage endpoint polled for each account's 5h / 7d usage
+    /// (`{"five_hour":{"utilization","resets_at"},"seven_day":{…}}`).
+    /// Empty disables polling; usage is still read from response headers.
+    pub usage_url: String,
+    pub usage_poll_secs: u64,
     pub anthropic_beta: String,
     pub user_agent: String,
     /// Prepend the literal Claude Code system block when missing — required
@@ -170,6 +179,8 @@ impl Default for UpstreamConfig {
             oauth_redirect_uri: "https://console.anthropic.com/oauth/code/callback".into(),
             oauth_scopes: "org:create_api_key user:profile user:inference".into(),
             profile_url: "https://api.anthropic.com/api/oauth/profile".into(),
+            usage_url: String::new(),
+            usage_poll_secs: 600,
             // Both betas are required for OAuth-bearer /v1/messages calls.
             anthropic_beta: "claude-code-20250219,oauth-2025-04-20".into(),
             user_agent: "claude-cli/1.0 (cc-manager)".into(),

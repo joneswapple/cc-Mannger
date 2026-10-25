@@ -9,8 +9,10 @@ use anyhow::Result;
 
 use crate::accounts::{Account, AccountStore, STATUS_ACTIVE};
 use crate::config::{PoolConfig, Strategy};
+use crate::events::CoreEvent;
 use crate::oauth::OAuthClient;
 use crate::provider::AccountProvider;
+use crate::quota::{Quota, QuotaSnapshot};
 
 /// Window for the `least_used` strategy.
 const LEAST_USED_WINDOW_SECS: i64 = 5 * 3600;
@@ -66,6 +68,10 @@ impl AccountPool {
         &self.cfg
     }
 
+    pub fn store(&self) -> &AccountStore {
+        &self.store
+    }
+
     /// Picks the account for one upstream attempt.
     ///
     /// Eligible: enabled, in the requested group, not excluded. Among those,
@@ -97,6 +103,9 @@ impl AccountPool {
                 .filter(|s| *s > 0)
                 .min()
             {
+                self.store
+                    .events()
+                    .send(CoreEvent::AllCooling { retry_after });
                 return Err(AllCooling { retry_after }.into());
             }
             return match eligible.first() {
@@ -104,6 +113,7 @@ impl AccountPool {
                 None => Err(NoAccount.into()),
             };
         }
+        let healthy = self.prefer_quota_headroom(healthy, now)?;
         let sticky_key = req
             .sticky_key
             .as_ref()
@@ -125,6 +135,52 @@ impl AccountPool {
             self.sticky_bind(key, chosen.id);
         }
         self.provider(chosen)
+    }
+
+    /// Drops accounts at or above `quota_soft_limit`, unless that would
+    /// leave none (then everything healthy stays in play).
+    fn prefer_quota_headroom<'a>(
+        &self,
+        healthy: Vec<&'a Account>,
+        now: i64,
+    ) -> Result<Vec<&'a Account>> {
+        let quotas = self.store.quotas()?;
+        let roomy: Vec<&Account> = healthy
+            .iter()
+            .copied()
+            .filter(|a| {
+                quotas
+                    .get(&a.id)
+                    .is_none_or(|q| q.effective_utilization(now) < self.cfg.quota_soft_limit)
+            })
+            .collect();
+        Ok(if roomy.is_empty() { healthy } else { roomy })
+    }
+
+    /// The account an unrestricted request would get next, without
+    /// touching round-robin or sticky state (tray / dashboard display).
+    pub fn preview(&self) -> Result<Option<Account>> {
+        let now = crate::now_unix();
+        let list = self.store.list()?;
+        let healthy: Vec<&Account> = list
+            .iter()
+            .filter(|a| a.enabled && a.status == STATUS_ACTIVE && a.cooldown_left(now) == 0)
+            .collect();
+        Ok(self
+            .prefer_quota_headroom(healthy, now)?
+            .first()
+            .map(|a| (*a).clone()))
+    }
+
+    /// Stores a quota reading taken from an upstream response.
+    pub fn record_quota(&self, id: i64, q: &QuotaSnapshot) {
+        if let Err(e) = self.store.save_quota(id, q) {
+            tracing::warn!(account = id, "record quota: {e:#}");
+        }
+    }
+
+    pub fn quotas(&self) -> Result<HashMap<i64, Quota>> {
+        self.store.quotas()
     }
 
     fn sticky_lookup(&self, key: &str) -> Option<i64> {
@@ -400,6 +456,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pick(&p, &sess("s1")), moved);
+    }
+
+    #[test]
+    fn quota_soft_limit_deprioritises_until_reset() {
+        let s = test_store();
+        let busy = add(&s, "busy", 9, 1, "");
+        let spare = add(&s, "spare", 0, 1, "");
+        let p = pool(&s, Strategy::Priority, false);
+        let now = crate::now_unix();
+        let snap = |u: f64, reset: i64| QuotaSnapshot {
+            five_hour_utilization: Some(u),
+            five_hour_reset: Some(reset),
+            ..Default::default()
+        };
+        p.record_quota(busy, &snap(0.97, now + 3600));
+        assert_eq!(pick(&p, &PickRequest::default()), spare);
+        assert_eq!(p.preview().unwrap().unwrap().id, spare);
+        // Both near the limit: fall back to plain priority.
+        p.record_quota(spare, &snap(0.99, now + 3600));
+        assert_eq!(pick(&p, &PickRequest::default()), busy);
+        // Once the busy account's window has reset it is preferred again.
+        p.record_quota(busy, &snap(0.97, now - 1));
+        assert_eq!(pick(&p, &PickRequest::default()), busy);
+    }
+
+    #[test]
+    fn events_for_reauth_cooldown_and_all_cooling() {
+        let s = test_store();
+        let a = add(&s, "a", 0, 1, "");
+        let mut rx = s.events().subscribe();
+        let p = pool(&s, Strategy::Priority, false);
+        s.set_status(a, STATUS_NEEDS_REAUTH, "gone").unwrap();
+        s.set_status(a, STATUS_NEEDS_REAUTH, "gone again").unwrap();
+        s.set_status(a, STATUS_ACTIVE, "").unwrap();
+        p.cool_down(a, 30, "429");
+        let _ = p.pick(&PickRequest::default());
+        let got: Vec<CoreEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(matches!(got[0], CoreEvent::NeedsReauth { account_id, .. } if account_id == a));
+        assert!(matches!(got[1], CoreEvent::CoolingDown { account_id, .. } if account_id == a));
+        assert!(matches!(got[2], CoreEvent::AllCooling { .. }));
+        assert_eq!(
+            got.len(),
+            3,
+            "a repeated needs_reauth is not re-announced: {got:?}"
+        );
     }
 
     #[test]

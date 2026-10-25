@@ -1193,3 +1193,46 @@ async fn local_bridge_needs_no_token_but_only_reaches_admin_api() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn captures_quota_headers_and_routes_around_exhausted_accounts() {
+    let h = harness().await;
+    let busy = h.add_account("busy", "busy-tok", 10, "");
+    h.reply_for(
+        "busy-tok",
+        Reply::Json(
+            200,
+            vec![
+                ("anthropic-ratelimit-unified-5h-utilization", "0.97"),
+                ("anthropic-ratelimit-unified-5h-reset", "9999999999"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.40"),
+                ("anthropic-ratelimit-unified-status", "allowed_warning"),
+            ],
+            r#"{"id":"m","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ),
+    );
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(h.tokens_seen().last().unwrap(), "busy-tok");
+
+    let (_, list) = h.admin("GET", "/admin/api/accounts", None).await;
+    let acct = list["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == busy)
+        .unwrap()
+        .clone();
+    assert_eq!(acct["quota"]["five_hour_utilization"], 0.97);
+    assert_eq!(acct["quota"]["seven_day_utilization"], 0.4);
+    assert_eq!(acct["quota"]["status"], "allowed_warning");
+    assert_ne!(
+        list["recommended"], busy,
+        "an account over the soft limit isn't recommended"
+    );
+
+    // Next request goes to the account with headroom.
+    h.messages(r#"{"model":"claude-test","messages":[]}"#, &[])
+        .await;
+    assert_eq!(h.tokens_seen().last().unwrap(), "upstream-access");
+}

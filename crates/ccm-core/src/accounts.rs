@@ -1,12 +1,15 @@
 //! Upstream Claude Pro/Max OAuth accounts. Metadata is plaintext; tokens are
 //! sealed with [`SecretBox`] before they reach SQLite.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
+use crate::events::{CoreEvent, Events};
+use crate::quota::{Quota, QuotaSnapshot};
 use crate::secret::SecretBox;
 use crate::store::Store;
 
@@ -81,6 +84,7 @@ pub struct Credentials {
 pub struct AccountStore {
     store: Store,
     secrets: Arc<SecretBox>,
+    events: Events,
 }
 
 const COLS: &str = "id, label, email, org_uuid, plan, priority, weight, enabled, status, \
@@ -130,7 +134,71 @@ fn aad(id: i64, field: &str) -> Vec<u8> {
 
 impl AccountStore {
     pub fn new(store: Store, secrets: Arc<SecretBox>) -> Self {
-        Self { store, secrets }
+        Self {
+            store,
+            secrets,
+            events: Events::default(),
+        }
+    }
+
+    /// Health changes made through this store (needs_reauth, cooldowns,
+    /// quota updates) are broadcast here.
+    pub fn events(&self) -> &Events {
+        &self.events
+    }
+
+    /// Merges a quota reading into the stored snapshot; fields the reading
+    /// lacks keep their previous value.
+    pub fn save_quota(&self, id: i64, q: &QuotaSnapshot) -> Result<()> {
+        if q.is_empty() {
+            return Ok(());
+        }
+        self.store.conn().execute(
+            "INSERT INTO account_quota(account_id, five_hour_utilization, five_hour_reset,
+                seven_day_utilization, seven_day_reset, status, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, COALESCE(?6, ''), ?7)
+             ON CONFLICT(account_id) DO UPDATE SET
+                five_hour_utilization = COALESCE(excluded.five_hour_utilization, five_hour_utilization),
+                five_hour_reset = COALESCE(?3, five_hour_reset),
+                seven_day_utilization = COALESCE(excluded.seven_day_utilization, seven_day_utilization),
+                seven_day_reset = COALESCE(?5, seven_day_reset),
+                status = COALESCE(?6, status),
+                updated_at = excluded.updated_at",
+            params![
+                id,
+                q.five_hour_utilization,
+                q.five_hour_reset,
+                q.seven_day_utilization,
+                q.seven_day_reset,
+                q.status,
+                crate::now_unix()
+            ],
+        )?;
+        self.events.send(CoreEvent::QuotaUpdated { account_id: id });
+        Ok(())
+    }
+
+    /// Stored quota per account.
+    pub fn quotas(&self) -> Result<HashMap<i64, Quota>> {
+        let conn = self.store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT account_id, five_hour_utilization, five_hour_reset, seven_day_utilization,
+                    seven_day_reset, status, updated_at FROM account_quota",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                Quota {
+                    five_hour_utilization: r.get(1)?,
+                    five_hour_reset: r.get(2)?,
+                    seven_day_utilization: r.get(3)?,
+                    seven_day_reset: r.get(4)?,
+                    status: r.get(5)?,
+                    updated_at: r.get(6)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Inserts an account and its sealed credentials in one transaction.
@@ -207,10 +275,18 @@ impl AccountStore {
     }
 
     pub fn set_status(&self, id: i64, status: &str, reason: &str) -> Result<()> {
+        let before = self.get(id)?.status;
         self.exec(
             "UPDATE accounts SET status = ?1, status_reason = ?2, updated_at = ?3 WHERE id = ?4",
             params![status, reason, crate::now_unix(), id],
-        )
+        )?;
+        if status == STATUS_NEEDS_REAUTH && before != STATUS_NEEDS_REAUTH {
+            self.events.send(CoreEvent::NeedsReauth {
+                account_id: id,
+                reason: reason.to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn set_enabled(&self, id: i64, enabled: bool) -> Result<()> {
@@ -226,7 +302,13 @@ impl AccountStore {
         self.exec(
             "UPDATE accounts SET cooldown_until = ?1, status_reason = ?2, updated_at = ?3 WHERE id = ?4",
             params![until, reason, crate::now_unix(), id],
-        )
+        )?;
+        self.events.send(CoreEvent::CoolingDown {
+            account_id: id,
+            seconds: until - crate::now_unix(),
+            reason: reason.to_string(),
+        });
+        Ok(())
     }
 
     pub fn update(&self, id: i64, p: &AccountPatch) -> Result<Account> {
@@ -328,7 +410,7 @@ impl AccountStore {
     }
 
     /// Input + output tokens per account since `since` (unix seconds).
-    pub fn recent_tokens(&self, since: i64) -> Result<std::collections::HashMap<i64, i64>> {
+    pub fn recent_tokens(&self, since: i64) -> Result<HashMap<i64, i64>> {
         let conn = self.store.conn();
         let mut stmt = conn.prepare(
             "SELECT account_id, COALESCE(SUM(input_tokens + output_tokens), 0)

@@ -225,10 +225,24 @@ async fn delete_invite(
 /// Account metadata only; tokens never leave the store. `now` lets clients
 /// turn `cooldown_until` into a countdown.
 async fn list_accounts(_: AdminAuth, State(core): State<Core>) -> ApiResult {
+    let quotas = core.pool.quotas().map_err(internal)?;
+    let accounts: Vec<serde_json::Value> = core
+        .accounts
+        .list()
+        .map_err(internal)?
+        .into_iter()
+        .map(|a| {
+            let quota = quotas.get(&a.id);
+            let mut v = serde_json::to_value(&a).unwrap_or_default();
+            v["quota"] = serde_json::to_value(quota).unwrap_or_default();
+            v
+        })
+        .collect();
     Ok(Json(json!({
-        "accounts": core.accounts.list().map_err(internal)?,
+        "accounts": accounts,
         "now": crate::now_unix(),
         "pool": core.pool.config(),
+        "recommended": core.pool.preview().map_err(internal)?.map(|a| a.id),
     }))
     .into_response())
 }

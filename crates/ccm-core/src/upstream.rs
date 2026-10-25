@@ -118,6 +118,10 @@ impl Upstream {
                     continue;
                 }
             };
+            let snapshot = crate::quota::from_headers(resp.headers());
+            if !snapshot.is_empty() {
+                self.pool.record_quota(account_id, &snapshot);
+            }
             let status = resp.status().as_u16();
             let verdict = classify(
                 status,
@@ -166,6 +170,39 @@ impl Upstream {
                 Err(ForwardError::Exhausted { last, failed })
             }
         }
+    }
+
+    /// Polls the configured usage endpoint for every enabled account.
+    pub async fn probe_usage(&self, usage_url: &str) {
+        let accounts = match self.pool.store().list() {
+            Ok(list) => list,
+            Err(e) => return tracing::warn!("usage probe: {e:#}"),
+        };
+        for a in accounts.into_iter().filter(|a| a.enabled) {
+            if let Err(e) = self.probe_one(usage_url, &a).await {
+                tracing::debug!(account = a.id, "usage probe failed: {e:#}");
+            }
+        }
+    }
+
+    async fn probe_one(&self, usage_url: &str, a: &crate::accounts::Account) -> Result<()> {
+        let provider = self.pool.provider_for(a.id)?;
+        let token = provider.token().await?;
+        let resp = self
+            .client_for(&provider.proxy_url)?
+            .get(usage_url)
+            .bearer_auth(token)
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("usage endpoint returned {}", resp.status());
+        }
+        let snap = crate::quota::from_usage_body(&resp.json().await?);
+        self.pool.record_quota(a.id, &snap);
+        Ok(())
     }
 
     async fn send_once(
