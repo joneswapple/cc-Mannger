@@ -281,3 +281,77 @@ export interface UserIp {
   last_seen: number;
   requests: number;
 }
+
+export interface IpRule {
+  id: number;
+  kind: "allow" | "deny";
+  cidr: string;
+  note: string;
+  expires_at: number | null;
+  created_at: number;
+  hits: number;
+}
+
+export interface AccessEntry {
+  id: number;
+  ts: number;
+  ip: string;
+  method: string;
+  path: string;
+  status: number;
+  blocked: boolean;
+  rule_id: number | null;
+}
+
+export interface IpStat {
+  ip: string;
+  requests: number;
+  blocked: number;
+  errors: number;
+  first_seen: number;
+  last_seen: number;
+  terminals: string[];
+}
+
+export interface ProxyEntry {
+  id: number;
+  name: string;
+  url: string;
+  created_at: number;
+  accounts: number[];
+}
+
+export interface ProxyTest {
+  ok: boolean;
+  latency_ms: number;
+  status: number | null;
+  error: string;
+}
+
+export interface LogLine {
+  seq: number;
+  ts_ms: number;
+  level: string;
+  target: string;
+  message: string;
+}
+
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  newer: boolean;
+  url: string;
+  notes: string;
+  published_at: string;
+}
+
+export interface SystemInfo {
+  version: string;
+  os: string;
+  arch: string;
+  data_dir: string;
+  database: string;
+  log_level: string;
+  update_check: boolean;
+  desktop: boolean;
+}

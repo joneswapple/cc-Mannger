@@ -5,7 +5,9 @@ import { LangProvider, useI18n } from "./i18n";
 import Accounts from "./pages/Accounts";
 import Dashboard from "./pages/Dashboard";
 import Monitor from "./pages/Monitor";
+import Mini from "./pages/Mini";
 import Proxy from "./pages/Proxy";
+import Security from "./pages/Security";
 import Settings from "./pages/Settings";
 import Terminals from "./pages/Terminals";
 import Usage from "./pages/Usage";
@@ -20,6 +22,7 @@ const PAGES = {
   monitor: Monitor,
   terminals: Terminals,
   usage: Usage,
+  security: Security,
   settings: Settings,
 } as const;
 
@@ -71,6 +74,8 @@ function Shell() {
 
   if (authed === null) return null;
   if (!authed) return <Login onLogin={() => setAuthed(true)} />;
+  // The desktop app's always-on-top mini window.
+  if (location.hash.startsWith("#mini")) return <Mini />;
 
   const Page = PAGES[page];
   const ThemeIcon = theme.pref === "light" ? Sun : theme.pref === "dark" ? Moon : MonitorIcon;

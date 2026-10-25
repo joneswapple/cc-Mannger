@@ -5,6 +5,7 @@ mod admin;
 mod insights;
 mod ops;
 mod proxy;
+mod system;
 
 pub use ops::LOCAL_CLAUDE_CODE_USER;
 
@@ -53,12 +54,17 @@ impl Core {
 }
 
 pub fn router(core: Core) -> Router {
-    Router::new()
+    // The terminal-facing surface goes through the IP rules and access log;
+    // the admin API never does, so a bad rule can't lock the admin out.
+    let guarded = Router::new()
         .route("/v1/messages", post(proxy::messages))
         .route("/v1/messages/count_tokens", post(proxy::count_tokens))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::models))
         .route("/register", post(admin::register))
+        .route_layer(middleware::from_fn_with_state(core.clone(), guard_ip));
+    Router::new()
+        .merge(guarded)
         .route("/oauth/callback", get(admin::oauth_callback))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
@@ -107,6 +113,20 @@ impl Core {
     pub fn start_background(&self) {
         self.background.call_once(|| {
             self.catalog.start(CATALOG_REFRESH);
+            let (security, runtime) = (self.security.clone(), self.runtime.clone());
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(3600));
+                loop {
+                    tick.tick().await;
+                    let days = runtime.get().security.access_log_days;
+                    let s = security.clone();
+                    match tokio::task::spawn_blocking(move || s.prune(days)).await {
+                        Ok(Ok(n)) if n > 0 => tracing::info!("access log: pruned {n} old entries"),
+                        Ok(Err(e)) => tracing::warn!("access log prune: {e:#}"),
+                        _ => {}
+                    }
+                }
+            });
             let url = self.config.upstream.usage_url.clone();
             if !url.is_empty() {
                 let upstream = self.upstream.clone();
@@ -181,15 +201,65 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({"status": "ok", "version": crate::VERSION}))
 }
 
+/// Applies the IP rules and records the access log for one request.
+async fn guard_ip(
+    axum::extract::State(core): axum::extract::State<Core>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let ip = client_ip(&parts, &core);
+    let method = parts.method.to_string();
+    let path = parts.uri.path().to_string();
+    let req = Request::from_parts(parts, body);
+    let entry = |status: u16, rule_id: Option<i64>, blocked: bool| crate::security::Access {
+        ts: crate::now_unix(),
+        ip: ip.clone(),
+        method: method.clone(),
+        path: path.clone(),
+        status,
+        blocked,
+        rule_id,
+    };
+    match core.security.check(&ip) {
+        Ok(()) => {
+            let resp = next.run(req).await;
+            if !ip.is_empty() {
+                core.security
+                    .log(entry(resp.status().as_u16(), None, false));
+            }
+            resp
+        }
+        Err(block) => {
+            let rule = match block {
+                crate::security::Block::Denied(id) => Some(id),
+                crate::security::Block::NotAllowed => None,
+            };
+            core.security.log(entry(403, rule, true));
+            let msg = core.runtime.get().security.block_message;
+            if path.starts_with("/v1/") {
+                anthropic_error(StatusCode::FORBIDDEN, "permission_error", msg)
+            } else {
+                json_error(StatusCode::FORBIDDEN, msg)
+            }
+        }
+    }
+}
+
 async fn log_requests(req: Request, next: Next) -> Response {
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
     let start = Instant::now();
     let resp = next.run(req).await;
-    tracing::info!(
-        "{method} {path} {} {}ms",
-        resp.status().as_u16(),
-        start.elapsed().as_millis()
-    );
+    let (status, ms) = (resp.status().as_u16(), start.elapsed().as_millis());
+    // The UI polls these every couple of seconds; keep them out of the
+    // info log (and the log viewer) unless asked for.
+    if method == axum::http::Method::GET
+        && (path.starts_with("/admin/api/logs") || path.starts_with("/admin/api/monitor"))
+    {
+        tracing::debug!("{method} {path} {status} {ms}ms");
+    } else {
+        tracing::info!("{method} {path} {status} {ms}ms");
+    }
     resp
 }
 

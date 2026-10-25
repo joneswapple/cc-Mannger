@@ -79,6 +79,13 @@ async fn fake_handler(
         }))
         .into_response();
     }
+    if uri.path() == "/releases/latest" {
+        return axum::Json(json!({
+            "tag_name": "v99.1.0", "html_url": "https://example.invalid/r", "body": "notes",
+            "published_at": "2026-10-01T00:00:00Z"
+        }))
+        .into_response();
+    }
     if uri.path() == "/v1/models" {
         return (
             [("content-type", "application/json")],
@@ -166,6 +173,7 @@ async fn harness() -> Harness {
     cfg.upstream.profile_url = format!("http://{addr}/api/oauth/profile");
     cfg.upstream.user_agent = "test-ua".into();
     cfg.upstream.anthropic_beta = "test-beta".into();
+    cfg.update_url = format!("http://{addr}/releases/latest");
     cfg.claude_settings_path = dir
         .path()
         .join("home/.claude/settings.json")
@@ -1926,4 +1934,179 @@ async fn stats_overview_prices_and_today_counts() {
         )
         .await;
     assert_eq!(mine["totals"]["requests"], 0);
+}
+
+async fn register_from(h: &Harness, ip: &str) -> StatusCode {
+    let mut req = Request::post("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"token":"nope","label":"x"}"#))
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("{ip}:1").parse().unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    h.call(req).await.0
+}
+
+#[tokio::test]
+async fn ip_rules_block_and_log_without_touching_admin() {
+    let h = harness().await;
+    h.admin(
+        "POST",
+        "/admin/api/runtime",
+        Some(json!({"security": {"block_message": "go away"}})),
+    )
+    .await;
+    let (s, r) = h
+        .admin(
+            "POST",
+            "/admin/api/security/rules",
+            Some(json!({"kind": "deny", "cidr": "10.0.0.5", "note": "abuse"})),
+        )
+        .await;
+    assert_eq!(s, 200, "{r}");
+    let deny_id = r["id"].as_i64().unwrap();
+    let (s, e) = from_ip(&h, &h.api_key, "10.0.0.5", &[]).await;
+    assert_eq!(s, 403);
+    assert_eq!(
+        (e["error"]["type"].clone(), e["error"]["message"].clone()),
+        (json!("permission_error"), json!("go away"))
+    );
+    assert_eq!(register_from(&h, "10.0.0.5").await, 403);
+    assert_eq!(from_ip(&h, &h.api_key, "10.0.0.6", &[]).await.0, 200);
+    // The admin API is never filtered.
+    assert_eq!(h.admin("GET", "/admin/api/status", None).await.0, 200);
+
+    // Allowlist mode.
+    h.admin(
+        "POST",
+        "/admin/api/security/rules",
+        Some(json!({"kind": "allow", "cidr": "192.168.0.0/16"})),
+    )
+    .await;
+    let (_, rules) = h.admin("GET", "/admin/api/security/rules", None).await;
+    assert_eq!(rules["allowlist_mode"], true);
+    assert_eq!(from_ip(&h, &h.api_key, "10.0.0.6", &[]).await.0, 403);
+    assert_eq!(from_ip(&h, &h.api_key, "192.168.7.7", &[]).await.0, 200);
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/security/rules",
+            Some(json!({"kind": "deny", "cidr": "1.2.3.4/40"})),
+        )
+        .await;
+    assert_eq!(s, 400);
+
+    let (_, log) = h
+        .admin("GET", "/admin/api/security/log?filter=blocked", None)
+        .await;
+    assert_eq!(log["total"], 3);
+    let (_, rules) = h.admin("GET", "/admin/api/security/rules", None).await;
+    let deny = rules["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == deny_id)
+        .unwrap()
+        .clone();
+    assert_eq!(deny["hits"], 2);
+    let (_, ips) = h.admin("GET", "/admin/api/security/ips?days=1", None).await;
+    let lan = ips["ips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["ip"] == "192.168.7.7")
+        .unwrap()
+        .clone();
+    assert_eq!(lan["terminals"], json!(["alice"]));
+    assert_eq!(lan["blocked"], 0);
+
+    let (s, _) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/security/rules/{deny_id}/delete"),
+            None,
+        )
+        .await;
+    assert_eq!(s, 204);
+    let (s, _) = h
+        .admin("POST", "/admin/api/security/rules/999/delete", None)
+        .await;
+    assert_eq!(s, 404);
+}
+
+#[tokio::test]
+async fn proxy_list_assign_and_test() {
+    let h = harness().await;
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/proxies",
+            Some(json!({"url": "ftp://x"})),
+        )
+        .await;
+    assert_eq!(s, 400);
+    let (s, p) = h
+        .admin(
+            "POST",
+            "/admin/api/proxies",
+            Some(json!({"name": "dead", "url": "http://127.0.0.1:9"})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let id = p["id"].as_i64().unwrap();
+    let (_, t) = h
+        .admin("POST", &format!("/admin/api/proxies/{id}/test"), None)
+        .await;
+    assert_eq!(t["ok"], false);
+    let second = h.add_account("b", "b-tok", 0, "");
+    let (s, p) = h
+        .admin(
+            "POST",
+            &format!("/admin/api/proxies/{id}/assign"),
+            Some(json!({"account_ids": [1, second]})),
+        )
+        .await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!(p["accounts"], json!([1, second]));
+    assert_eq!(
+        h.core.accounts.get(second).unwrap().proxy_url,
+        "http://127.0.0.1:9"
+    );
+    // Unlisted accounts go back to direct.
+    h.admin(
+        "POST",
+        &format!("/admin/api/proxies/{id}/assign"),
+        Some(json!({"account_ids": [second]})),
+    )
+    .await;
+    assert_eq!(h.core.accounts.get(1).unwrap().proxy_url, "");
+    let (_, list) = h.admin("GET", "/admin/api/proxies", None).await;
+    assert_eq!(list["proxies"][0]["accounts"], json!([second]));
+    let (s, _) = h
+        .admin("POST", &format!("/admin/api/proxies/{id}/delete"), None)
+        .await;
+    assert_eq!(s, 204);
+}
+
+#[tokio::test]
+async fn logs_update_check_and_system() {
+    let h = harness().await;
+    ccm_core::logbuf::buffer().push(&tracing::Level::WARN, "test", "marker line".into());
+    let (_, l) = h
+        .admin("GET", "/admin/api/logs?level=WARN&limit=10", None)
+        .await;
+    assert!(l["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["message"] == "marker line"));
+    let (s, u) = h.admin("GET", "/admin/api/update/check", None).await;
+    assert_eq!(s, 200, "{u}");
+    assert_eq!(
+        (u["latest"].clone(), u["newer"].clone()),
+        (json!("v99.1.0"), json!(true))
+    );
+    let (_, sys) = h.admin("GET", "/admin/api/system", None).await;
+    assert_eq!(sys["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(sys["desktop"], false);
 }

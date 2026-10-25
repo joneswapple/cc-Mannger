@@ -68,12 +68,18 @@ struct ExpandArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(cli.config.as_deref())?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log_level)),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        // Console output plus the in-memory buffer behind the UI log viewer.
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log_level)),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(ccm_core::logbuf::layer())
+            .init();
+    }
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(cfg).await,

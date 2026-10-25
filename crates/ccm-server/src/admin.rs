@@ -89,6 +89,22 @@ pub enum AdminCommand {
     TestModel { model: String },
     #[command(subcommand)]
     ClaudeCode(ClaudeCodeCommand),
+    #[command(subcommand)]
+    Security(SecurityCommand),
+    #[command(subcommand)]
+    Proxy(ProxyCommand),
+    /// Recent server log lines.
+    Logs {
+        /// ERROR | WARN | INFO | DEBUG
+        #[arg(long, default_value = "INFO")]
+        level: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Compare this build with the latest GitHub release.
+    UpdateCheck,
+    /// Version, platform and data paths.
+    System,
     /// Reset the admin token in the local database (no server needed).
     ResetToken {
         /// Explicit token to install (default: random).
@@ -118,6 +134,71 @@ pub enum MonitorCommand {
     /// Stop recording requests.
     Off,
     Clear,
+}
+
+/// IP rules and the access log for `/v1/*` and `/register`.
+#[derive(Subcommand)]
+pub enum SecurityCommand {
+    Rules,
+    /// Allow an IP or CIDR (any allow rule turns on allowlist mode).
+    Allow {
+        cidr: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Lapse after this many hours (default: permanent).
+        #[arg(long)]
+        hours: Option<i64>,
+    },
+    /// Block an IP or CIDR.
+    Deny {
+        cidr: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long)]
+        hours: Option<i64>,
+    },
+    DeleteRule {
+        id: i64,
+    },
+    /// Access log, newest first.
+    Log {
+        #[arg(long)]
+        ip: Option<String>,
+        /// Only blocked requests.
+        #[arg(long)]
+        blocked: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Per-IP totals.
+    Ips {
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
+}
+
+/// The shared upstream proxy list.
+#[derive(Subcommand)]
+pub enum ProxyCommand {
+    List,
+    Add {
+        url: String,
+        #[arg(long, default_value = "")]
+        name: String,
+    },
+    Delete {
+        id: i64,
+    },
+    /// Reach the upstream through the proxy.
+    Test {
+        id: i64,
+    },
+    /// Route exactly these accounts through the proxy.
+    Assign {
+        id: i64,
+        #[arg(value_delimiter = ',')]
+        accounts: Vec<i64>,
+    },
 }
 
 /// The server machine's `~/.claude/settings.json`.
@@ -588,6 +669,65 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             c.post("/admin/api/claude-code/restore", Value::Null)
                 .await?
         }
+        AdminCommand::Security(SecurityCommand::Rules) => {
+            c.get("/admin/api/security/rules").await?
+        }
+        AdminCommand::Security(SecurityCommand::Allow { cidr, note, hours }) => {
+            let body = json!({"kind": "allow", "cidr": cidr, "note": note, "expires_hours": hours.unwrap_or(0)});
+            c.post("/admin/api/security/rules", body).await?
+        }
+        AdminCommand::Security(SecurityCommand::Deny { cidr, note, hours }) => {
+            let body = json!({"kind": "deny", "cidr": cidr, "note": note, "expires_hours": hours.unwrap_or(0)});
+            c.post("/admin/api/security/rules", body).await?
+        }
+        AdminCommand::Security(SecurityCommand::DeleteRule { id }) => {
+            c.post(
+                &format!("/admin/api/security/rules/{id}/delete"),
+                Value::Null,
+            )
+            .await?
+        }
+        AdminCommand::Security(SecurityCommand::Log { ip, blocked, limit }) => {
+            let mut q = vec![("page_size", limit.to_string())];
+            q.extend(ip.map(|v| ("ip", v)));
+            if blocked {
+                q.push(("filter", "blocked".into()));
+            }
+            c.get_query("/admin/api/security/log", &q).await?
+        }
+        AdminCommand::Security(SecurityCommand::Ips { days }) => {
+            c.get(&format!("/admin/api/security/ips?days={days}"))
+                .await?
+        }
+        AdminCommand::Proxy(ProxyCommand::List) => c.get("/admin/api/proxies").await?,
+        AdminCommand::Proxy(ProxyCommand::Add { url, name }) => {
+            c.post("/admin/api/proxies", json!({"url": url, "name": name}))
+                .await?
+        }
+        AdminCommand::Proxy(ProxyCommand::Delete { id }) => {
+            c.post(&format!("/admin/api/proxies/{id}/delete"), Value::Null)
+                .await?
+        }
+        AdminCommand::Proxy(ProxyCommand::Test { id }) => {
+            c.post(&format!("/admin/api/proxies/{id}/test"), Value::Null)
+                .await?
+        }
+        AdminCommand::Proxy(ProxyCommand::Assign { id, accounts }) => {
+            c.post(
+                &format!("/admin/api/proxies/{id}/assign"),
+                json!({ "account_ids": accounts }),
+            )
+            .await?
+        }
+        AdminCommand::Logs { level, limit } => {
+            c.get_query(
+                "/admin/api/logs",
+                &[("level", level), ("limit", limit.to_string())],
+            )
+            .await?
+        }
+        AdminCommand::UpdateCheck => c.get("/admin/api/update/check").await?,
+        AdminCommand::System => c.get("/admin/api/system").await?,
         AdminCommand::ResetToken { .. } => unreachable!("handled locally"),
     };
     match out {

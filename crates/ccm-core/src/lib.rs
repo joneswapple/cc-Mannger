@@ -9,6 +9,7 @@ pub mod claude_code;
 pub mod config;
 pub mod events;
 pub mod http;
+pub mod logbuf;
 pub mod login;
 mod metrics;
 pub mod monitor;
@@ -18,13 +19,16 @@ pub mod openai;
 pub mod policy;
 pub mod pool;
 pub mod provider;
+pub mod proxies;
 pub mod quota;
 pub mod rewrite;
 pub mod routing;
 pub mod runtime;
 pub mod secret;
+pub mod security;
 pub mod stats;
 pub mod store;
+pub mod update;
 pub mod upstream;
 
 use std::sync::Arc;
@@ -40,9 +44,11 @@ use crate::monitor::Monitor;
 use crate::oauth::OAuthClient;
 use crate::policy::Engine;
 use crate::pool::AccountPool;
+use crate::proxies::ProxyList;
 use crate::routing::ModelRouter;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::secret::SecretBox;
+use crate::security::Security;
 use crate::stats::Recorder;
 use crate::store::Store;
 use crate::upstream::{Catalog, Upstream};
@@ -68,6 +74,8 @@ pub struct Core {
     pub routing: ModelRouter,
     pub runtime: Runtime,
     pub monitor: Monitor,
+    pub security: Security,
+    pub proxies: ProxyList,
     /// The address the proxy listener is bound to, while it runs.
     listening: Arc<std::sync::RwLock<Option<String>>>,
     /// Start / stop hooks for the listener, when the host can provide them
@@ -131,6 +139,8 @@ impl Core {
                 login: LoginManager::new(&config.upstream),
                 routing: ModelRouter::new(store.clone(), rt.routing.clone()),
                 monitor: Monitor::new(rt.monitor.clone()),
+                security: Security::new(store.clone())?,
+                proxies: ProxyList::new(store.clone()),
                 runtime,
                 listening: Default::default(),
                 service: Default::default(),

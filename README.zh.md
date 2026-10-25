@@ -22,9 +22,16 @@ English: [README.md](./README.md) · 阶段计划：[docs/ROADMAP.zh.md](./docs/
   自动切换账号并冷却；账号分组；按 5 小时 / 7 天额度用量避开快用完的账号。
 - **终端**：邀请码自助注册；`sk-cp-…` Key（bcrypt 存储、只显示一次）；终端策略（模型白名单、
   每分钟请求数、每日 token、账号组）；全局禁用模型；模型路由（别名 / 正则）。
-- **管理**：React 网页界面（桌面窗口或浏览器）、JSON 接口、命令行、用量统计与搜索、Prometheus `/metrics`。
-- **桌面端**：托盘显示当前账号和额度、快速切换账号、启停代理；账号失效或全部限流时发系统通知。
-  安装包：NSIS（Windows）、AppImage / deb、dmg。
+- **管理**：React 网页界面（桌面窗口或浏览器，中 / 英文、浅色 / 深色）、JSON 接口、命令行、Prometheus `/metrics`。
+- **API 反代页**：服务状态与启停、局域网访问与端口、按家族 / 自定义模型映射、后台任务模型、模型连通性测试、
+  接入示例、一键同步到本机 Claude Code（可还原）。
+- **请求监控**：可开关的内存录制，查看客户端请求 / 上游请求 / 响应体、首字耗时、映射后模型、账号与失败切换记录。
+- **统计**：按小时 / 天 / 周的趋势（可按模型、账号、终端拆分）、按可编辑价格表估算费用、活跃时段热力图。
+- **终端**：Key 有效期与续期、24 小时 IP 数上限、每个终端的用量与来源 IP。
+- **安全**：CIDR 黑 / 白名单（可设有效期）、IP 访问日志与统计（管理后台不受规则影响）。
+- **设置中心**：调度、代理池、额度刷新等运行时可改（存数据库、即时生效），实时运行日志，检查更新。
+- **桌面端**：托盘显示当前账号和额度、快速切换账号、启停代理；账号失效或全部限流时发系统通知；
+  置顶迷你窗口；开机自启。安装包：NSIS（Windows）、AppImage / deb、dmg。
 - **无界面**：`ccm-server` 单个二进制（内嵌网页界面）、Docker 镜像、安装脚本。
 
 ## 快速开始
@@ -151,6 +158,11 @@ ccm-server admin account set 2 --priority 10 --group team --proxy socks5://127.0
 ccm-server admin invite create --label alice --ttl-hours 24
 ccm-server admin user policy 3 --rpm 10 --daily-tokens 2000000 --group team
 ccm-server admin models routes 're:^gpt-4=claude-sonnet-4-5'
+ccm-server admin key issue 3 --ttl-days 30        # 30 天后过期；renew 7 --days 90 续期
+ccm-server admin settings '{"pool":{"strategy":"least_used"}}'   # 运行时修改设置
+ccm-server admin monitor on                       # 开启请求录制
+ccm-server admin claude-code sync --base-url http://127.0.0.1:8787
+ccm-server admin security deny 203.0.113.0/24 --hours 24
 ccm-server admin reset-token                      # 忘了管理员令牌时，直接写本地数据库
 ccm-server migrate-from-go --go-data-dir ~/.local/share/cliproxy
 ```

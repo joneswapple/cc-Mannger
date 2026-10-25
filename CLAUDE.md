@@ -11,7 +11,7 @@ and OpenAI Chat Completions requests from per-terminal `sk-cp-…` keys it
 issues itself. It is a Tauri v2 desktop app plus a headless server over one
 Rust core, modelled on lbjlaq/Antigravity-Manager. Claude OAuth accounts
 only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
-(R0–R9 are done; the Go cliproxy has been removed).
+(R0–R10 are done; the Go cliproxy has been removed).
 
 ## Build / run / test
 
@@ -63,6 +63,14 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
     (off by default); filled by `proxy::dispatch` via a `Draft`.
   - `claude_code.rs` — writes / restores `~/.claude/settings.json` env
     (backup on first sync).
+  - `security.rs` — CIDR deny / allow rules (allowlist mode while any
+    allow rule is active) and the IP access log (own writer thread,
+    pruned hourly); applied by `http::guard_ip` to `/v1/*` and `/register`
+    only, never to the admin API.
+  - `proxies.rs` — shared proxy list; assigning writes `accounts.proxy_url`.
+  - `logbuf.rs` — tracing layer keeping recent log lines for the UI log
+    viewer (hosts install it next to the fmt layer). `update.rs` — GitHub
+    latest-release check.
   - `auth/` — `sk-cp-` keys (bcrypt, 12-char prefix index, Go 8-char prefixes
     still resolve, 60 s cache keyed by sha256, optional `expires_at`
     checked on every lookup), invites (sha256 only),
@@ -92,15 +100,18 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
     settings, `/service` (listener start/stop through the host's
     `ServiceControl`), monitor, model test, Claude Code sync. `ClientIp`
     extracts the peer (or forwarded) address; `insights.rs` stats
-    overview, prices, key expiry, terminal IPs.
+    overview, prices, key expiry, terminal IPs; `system.rs`
+    security rules / log / IP stats, proxies, logs, update check, system info.
 - `crates/ccm-server` — headless binary: `serve`, `config`, `admin …`
   (HTTP client over `/admin/api/*`, except `reset-token`), `effort …`,
   `migrate-from-go`. `build.rs` + rust-embed embed `dist/` (placeholder page
   when the UI isn't built) and serve it at `/`.
 - `src-tauri` — desktop shell: runs `ccm_core::http::serve` in-process
   (start/stop from the tray), tray with current account / quota / switch,
-  notifications from `CoreEvent`s, hide-to-tray. Commands: `admin_request`
-  (the UI bridge) and `open_url`. NSIS hooks in `src-tauri/windows/`.
+  notifications from `CoreEvent`s, hide-to-tray, always-on-top mini window
+  (`#mini` route), launch at login (tauri-plugin-autostart). Commands:
+  `admin_request` (the UI bridge), `open_url`, and desktop-only
+  `desktop_autostart`, `open_mini`, `show_main_window`. NSIS hooks in `src-tauri/windows/`.
 - `src/` + `index.html` — React + TypeScript + Vite + Tailwind UI for both
   shells; `src/api.ts` sends every call to `/admin/api/*`, via the
   `admin_request` bridge in the desktop app or HTTP + admin token in a

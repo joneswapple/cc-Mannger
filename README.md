@@ -30,11 +30,28 @@ for Claude only.
 - **Terminals**: invite-based self-registration, `sk-cp-…` keys (bcrypt,
   shown once), per-terminal policies (model allowlist, RPM, daily tokens,
   account group), a global model denylist and model routes (aliases/regex).
-- **Admin**: React web UI (desktop window or browser), JSON API, CLI, usage
-  stats and search, Prometheus `/metrics`.
+- **Admin**: React web UI (desktop window or browser, Chinese / English,
+  light / dark), JSON API, CLI, Prometheus `/metrics`.
+- **API proxy page**: listener status and start/stop, LAN access and port,
+  family / custom model mapping, background-task model, per-model
+  connectivity test, client snippets, one-click "point this machine's
+  Claude Code here" (with restore).
+- **Request monitor**: opt-in, in-memory recording of recent requests with
+  client / upstream / response bodies, TTFT, mapped model, account and
+  failover attempts.
+- **Stats**: hourly / daily / weekly trends by model, account or terminal,
+  estimated cost from an editable price table, activity heatmap.
+- **Terminals**: key expiry and renewal, a distinct-IP limit per 24 h,
+  per-terminal usage and IP history.
+- **Security**: CIDR deny / allow lists with expiry, IP access log and
+  per-IP stats (the admin API is never filtered).
+- **Settings center**: scheduling, proxy pool, usage polling and more
+  changeable at runtime (saved in the database, applied without restart),
+  live log viewer, update check.
 - **Desktop**: tray with current account and quota, account switching,
   start/stop, notifications when an account needs a new login or everything
-  is rate limited. Installers: NSIS (Windows), AppImage/deb, dmg.
+  is rate limited, always-on-top mini window, launch at login. Installers:
+  NSIS (Windows), AppImage/deb, dmg.
 - **Headless**: `ccm-server` single binary with the UI embedded, Docker image,
   install scripts.
 
@@ -215,6 +232,20 @@ Admin endpoints need `Authorization: Bearer <admin token>` (or
 | `POST` | `/admin/api/settings/refresh-models`         | admin         | Refetch the model catalog.                              |
 | `GET`  | `/admin/api/stats?days=N`                    | admin         | Rollups by day, user, model, account.                   |
 | `GET`  | `/admin/api/usage`                           | admin         | Search: `q`, `user_id`, `account_id`, `model`, `status`, `since`, `until`, `min_tokens`, `only_error`, `sort`, `page`, `page_size`. |
+| `GET`  | `/admin/api/stats/overview`                  | admin         | `days`, `granularity` (hour/day/week), `group` (none/model/account/user), `user_id`, `tz_offset` → series, rollups with cost, heatmap. |
+| `GET` `POST` | `/admin/api/settings/prices`           | admin         | Price table for cost estimates (`[]` restores defaults). |
+| `POST` | `/admin/api/keys/{id}/expiry`                | admin         | `{days}` or `{expires_at}` (null = never).              |
+| `GET`  | `/admin/api/users/{id}/ips`                  | admin         | IPs a terminal used.                                    |
+| `GET` `POST` | `/admin/api/runtime`                   | admin         | Runtime settings; POST a JSON merge patch (`null` resets). |
+| `GET`  | `/admin/api/service`, `POST /service/{start,stop,restart}` | admin | Listener status / control (desktop app only).  |
+| `GET`  | `/admin/api/monitor`, `/monitor/{id}`, `POST /monitor/clear` | admin | Request monitor (enable via `runtime.monitor.enabled`). |
+| `POST` | `/admin/api/proxy/test`                      | admin         | `{model}` → tiny request through the pool.              |
+| `GET`  | `/admin/api/claude-code`, `POST /claude-code/{sync,restore}` | admin | This machine's `~/.claude/settings.json`.        |
+| `GET` `POST` | `/admin/api/security/rules`, `POST /security/rules/{id}/delete` | admin | IP rules `{kind, cidr, note, expires_hours}`. |
+| `GET`  | `/admin/api/security/log`, `/security/ips`   | admin         | Access log (`ip`, `filter`, `page`) / per-IP stats.     |
+| `GET` `POST` | `/admin/api/proxies`, `POST /proxies/test`, `/proxies/{id}/{delete,test,assign}` | admin | Shared proxy list. |
+| `GET`  | `/admin/api/logs`, `POST /logs/clear`        | admin         | Recent log lines (`after`, `level`, `limit`).           |
+| `GET`  | `/admin/api/update/check`, `/admin/api/system` | admin       | Latest release vs this build / version and paths.       |
 
 Errors under `/v1/*` use Anthropic's `{"type":"error","error":{"type","message"}}`
 shape (OpenAI SDKs read `error.message` from it too); admin errors are
@@ -236,7 +267,19 @@ ccm-server admin user policy 3 --allow claude-sonnet-4-5 --rpm 10 --daily-tokens
 ccm-server admin key issue 3 | revoke 7
 ccm-server admin models list | disable claude-opus-4-1 | refresh
 ccm-server admin models routes 're:^gpt-4=claude-sonnet-4-5' 'gpt-3.5-turbo=claude-haiku-4-5'
+ccm-server admin key issue 3 --ttl-days 30 | renew 7 --days 90
+ccm-server admin user policy 3 --max-ips 2 | ips 3
 ccm-server admin stats --days 7
+ccm-server admin overview --days 30 --granularity day --group model
+ccm-server admin prices | prices '[{"pattern":"sonnet","input":3,"output":15,"cache_read":0.3,"cache_write":3.75}]'
+ccm-server admin settings | settings '{"pool":{"strategy":"least_used"}}'
+ccm-server admin service status | restart
+ccm-server admin monitor on | list --status error | show 12 | off | clear
+ccm-server admin test-model claude-sonnet-4-5
+ccm-server admin claude-code status | sync --base-url http://127.0.0.1:8787 | restore
+ccm-server admin security rules | deny 203.0.113.0/24 --hours 24 | allow 10.0.0.0/8 | delete-rule 3 | log --blocked | ips
+ccm-server admin proxy list | add socks5h://127.0.0.1:1080 --name hk | test 1 | assign 1 2,3
+ccm-server admin logs --level WARN | update-check | system
 ccm-server admin usage --status error --page-size 20
 ccm-server admin reset-token [--token my-secret]      # local DB, no server needed
 ccm-server effort list | expand --tier high

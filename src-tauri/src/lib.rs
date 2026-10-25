@@ -100,6 +100,51 @@ fn open_url(app: AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Reads, or with `enable` sets, whether the app starts at login.
+#[tauri::command]
+fn desktop_autostart(app: AppHandle, enable: Option<bool>) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let al = app.autolaunch();
+    match enable {
+        Some(true) => al.enable().map_err(|e| e.to_string())?,
+        Some(false) => al.disable().map_err(|e| e.to_string())?,
+        None => {}
+    }
+    al.is_enabled().map_err(|e| e.to_string())
+}
+
+/// Opens (or focuses) the always-on-top mini window.
+#[tauri::command]
+fn open_mini(app: AppHandle) -> Result<(), String> {
+    show_mini(&app).map_err(|e| format!("{e:#}"))
+}
+
+/// Brings the main window forward (from the mini window).
+#[tauri::command]
+fn show_main_window(app: AppHandle) {
+    show_main(&app);
+}
+
+fn show_mini(app: &AppHandle) -> anyhow::Result<()> {
+    if let Some(w) = app.get_webview_window("mini") {
+        w.show()?;
+        w.set_focus()?;
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "mini",
+        tauri::WebviewUrl::App("index.html#mini".into()),
+    )
+    .title("CC Manager")
+    .inner_size(340.0, 260.0)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .build()?;
+    Ok(())
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -250,6 +295,7 @@ fn try_refresh_tray(app: &AppHandle) -> anyhow::Result<()> {
         .collect();
     let switch = Submenu::with_items(app, "切换首选账号", !switch_items.is_empty(), &switch_refs)?;
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let mini = MenuItem::with_id(app, "mini", "迷你窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
@@ -263,6 +309,7 @@ fn try_refresh_tray(app: &AppHandle) -> anyhow::Result<()> {
             &switch,
             &sep2,
             &show,
+            &mini,
             &quit,
         ],
     )?;
@@ -278,6 +325,11 @@ fn try_refresh_tray(app: &AppHandle) -> anyhow::Result<()> {
 fn on_menu(app: &AppHandle, id: &str) {
     match id {
         "show" => show_main(app),
+        "mini" => {
+            if let Err(e) = show_mini(app) {
+                tracing::warn!("mini window: {e:#}");
+            }
+        }
         "quit" => app.exit(0),
         "toggle" => {
             if proxy_running(app) {
@@ -423,24 +475,44 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        // Console output plus the in-memory buffer behind the UI log viewer.
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(ccm_core::logbuf::layer())
+            .init();
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(setup)
         .on_window_event(|window, event| {
-            // Closing the window keeps the proxy running in the tray.
+            // Closing the main window keeps the proxy running in the tray;
+            // the mini window just closes.
             if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
                 let _ = window.hide();
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![admin_request, open_url])
+        .invoke_handler(tauri::generate_handler![
+            admin_request,
+            open_url,
+            desktop_autostart,
+            open_mini,
+            show_main_window
+        ])
         .run(tauri::generate_context!())
         .expect("error while running CC Manager");
 }

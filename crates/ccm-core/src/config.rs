@@ -26,6 +26,9 @@ pub struct Config {
     /// Claude Code settings file written by "sync to this machine"; empty
     /// means `~/.claude/settings.json`.
     pub claude_settings_path: String,
+    /// GitHub "latest release" API URL for the update check; empty
+    /// disables it.
+    pub update_url: String,
 }
 
 /// Client-IP handling for `/v1/*` and `/register` (`security.rs`).
@@ -267,6 +270,8 @@ impl Default for Config {
             security: SecurityConfig::default(),
             desktop: DesktopConfig::default(),
             claude_settings_path: String::new(),
+            update_url: "https://api.github.com/repos/joneswapple/cc-Mannger/releases/latest"
+                .into(),
         }
     }
 }
