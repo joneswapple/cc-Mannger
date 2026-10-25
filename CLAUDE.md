@@ -11,7 +11,7 @@ and OpenAI Chat Completions requests from per-terminal `sk-cp-…` keys it
 issues itself. It is a Tauri v2 desktop app plus a headless server over one
 Rust core, modelled on lbjlaq/Antigravity-Manager. Claude OAuth accounts
 only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
-(R0–R6 are done; the Go cliproxy has been removed).
+(R0–R8 are done; the Go cliproxy has been removed).
 
 ## Build / run / test
 
@@ -31,6 +31,10 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
 - `crates/ccm-core` — all logic, no GUI dependencies. `Core` (lib.rs) wires
   every long-lived component once; it is cheap to clone and is the Axum state.
   - `config.rs` — defaults → `config.json` → `CCM_*` env.
+  - `runtime.rs` — the hot-reloadable subset (listen, pool, routing,
+    monitor, security, desktop, usage poll): UI saves are a JSON merge
+    patch in `global_settings` applied over the config values;
+    `Core::update_runtime` validates, saves and pushes to the components.
   - `store.rs` — one rusqlite connection behind a mutex; migrations in
     `migrations/*.sql` are listed in `MIGRATIONS` and recorded in
     `schema_migrations`, so a new migration may be non-idempotent. Never hold
@@ -55,6 +59,10 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
     `global_settings`, optional background downgrade.
   - `openai.rs` — Chat Completions ⇄ Messages translation incl. SSE.
   - `metrics.rs` — Prometheus text from `Recorder` counters and accounts.
+  - `monitor.rs` — in-memory ring buffer of recent requests with bodies
+    (off by default); filled by `proxy::dispatch` via a `Draft`.
+  - `claude_code.rs` — writes / restores `~/.claude/settings.json` env
+    (backup on first sync).
   - `auth/` — `sk-cp-` keys (bcrypt, 12-char prefix index, Go 8-char prefixes
     still resolve, 60 s cache keyed by sha256), invites (sha256 only),
     admin token (bcrypt in `global_settings`).
@@ -74,8 +82,11 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
   - `http/` — `mod.rs` router, `ApiIdentity` / `AdminAuth` extractors,
     error helpers, `call_local` + `TrustedLocal` (in-process admin bridge);
     `proxy.rs` the `/v1` handlers on one `dispatch` pipeline (routing →
-    effort → policy → injection → forward → stats); `admin.rs`
-    `/admin/api/*`, `/register`, `/oauth/callback`.
+    effort → policy → injection → forward → stats + monitor); `admin.rs`
+    `/admin/api/*`, `/register`, `/oauth/callback`; `ops.rs` runtime
+    settings, `/service` (listener start/stop through the host's
+    `ServiceControl`), monitor, model test, Claude Code sync. `ClientIp`
+    extracts the peer (or forwarded) address.
 - `crates/ccm-server` — headless binary: `serve`, `config`, `admin …`
   (HTTP client over `/admin/api/*`, except `reset-token`), `effort …`,
   `migrate-from-go`. `build.rs` + rust-embed embed `dist/` (placeholder page
@@ -107,8 +118,11 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
   Tauri commands; the UI calls it via `src/api.ts`.
 - **Upstream wire format** (headers, OAuth) changes go in `upstream.rs` /
   `oauth.rs`, with a fake-server test.
-- **Config precedence:** defaults → `config.json` → `CCM_*` env; add new
-  options to `config.rs` (`Default` impl + `apply_env` when overridable).
+- **Config precedence:** defaults → `config.json` → `CCM_*` env → runtime
+  overrides saved from the UI (only the `RuntimeConfig` subset). Add new
+  options to `config.rs` (`Default` impl + `apply_env` when overridable);
+  if they should change without a restart, also add them to
+  `RuntimeConfig` and apply them in `Core::update_runtime`.
 
 ## Working in this repo
 

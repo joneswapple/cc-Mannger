@@ -20,10 +20,87 @@ pub struct Config {
     pub pool: PoolConfig,
     pub routing: RoutingConfig,
     pub admin: AdminConfig,
+    pub monitor: MonitorConfig,
+    pub security: SecurityConfig,
+    pub desktop: DesktopConfig,
+    /// Claude Code settings file written by "sync to this machine"; empty
+    /// means `~/.claude/settings.json`.
+    pub claude_settings_path: String,
+}
+
+/// Client-IP handling for `/v1/*` and `/register` (`security.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Message returned to a blocked IP.
+    pub block_message: String,
+    /// Take the client IP from `X-Forwarded-For` / `X-Real-IP`. Only safe
+    /// behind a reverse proxy that sets them; otherwise clients can spoof.
+    pub trust_forwarded_for: bool,
+    /// Days of the IP access log to keep.
+    pub access_log_days: i64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            block_message: "access from this IP address is not allowed".into(),
+            trust_forwarded_for: false,
+            access_log_days: 7,
+        }
+    }
+}
+
+impl SecurityConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=365).contains(&self.access_log_days) {
+            anyhow::bail!("security.access_log_days must be between 1 and 365");
+        }
+        Ok(())
+    }
+}
+
+/// The request monitor (`monitor.rs`): recent requests with their bodies,
+/// kept in memory only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorConfig {
+    /// Off by default: recorded bodies contain prompts and completions.
+    pub enabled: bool,
+    /// Requests kept; the oldest is dropped first.
+    pub capacity: usize,
+    /// Bytes kept per body (request, upstream request, response).
+    pub max_body_bytes: usize,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capacity: 500,
+            max_body_bytes: 256 << 10,
+        }
+    }
+}
+
+/// Desktop-shell behaviour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopConfig {
+    /// Start the proxy listener when the app starts.
+    pub auto_start_proxy: bool,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            auto_start_proxy: true,
+        }
+    }
 }
 
 /// Model rewriting beyond the editable route list (see `routing.rs`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingConfig {
     /// Send small, tool-less requests (titles, summaries) to this model;
@@ -43,7 +120,7 @@ impl Default for RoutingConfig {
 }
 
 /// How requests are spread over upstream accounts and retried.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PoolConfig {
     /// `priority` (highest priority first), `round_robin` (weighted by
@@ -186,6 +263,10 @@ impl Default for Config {
             pool: PoolConfig::default(),
             routing: RoutingConfig::default(),
             admin: AdminConfig::default(),
+            monitor: MonitorConfig::default(),
+            security: SecurityConfig::default(),
+            desktop: DesktopConfig::default(),
+            claude_settings_path: String::new(),
         }
     }
 }
@@ -250,6 +331,7 @@ impl Config {
         set(&mut self.upstream.base_url, "CCM_UPSTREAM_BASE_URL");
         set(&mut self.upstream.credentials_path, "CCM_CREDENTIALS_PATH");
         set(&mut self.admin.initial_token, "CCM_ADMIN_TOKEN");
+        set(&mut self.claude_settings_path, "CCM_CLAUDE_SETTINGS");
         if let Some(v) = get("CCM_POOL_STRATEGY").filter(|v| !v.is_empty()) {
             match v.parse() {
                 Ok(s) => self.pool.strategy = s,

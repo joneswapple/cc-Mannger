@@ -1,13 +1,13 @@
-import { ArrowRight, Info, Plus, RefreshCw, Route, Save, Server, Shuffle, Trash2, Boxes } from "lucide-react";
+import { Boxes, Info, RefreshCw, Save, Server, Shuffle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { get, isTauri, post } from "../api";
 import { fmtTime } from "../format";
 import { useI18n } from "../i18n";
 import { useToast } from "../toast";
-import type { AccountsResponse, ModelRoute, Settings as SettingsData, Status } from "../types";
-import { Badge, Button, Card, ErrorBox, IconButton, Segmented, inputClass, useAction, useLoad } from "../ui";
+import type { AccountsResponse, Settings as SettingsData, Status } from "../types";
+import { Badge, Button, Card, ErrorBox, Segmented, useAction, useLoad } from "../ui";
 
-type Tab = "models" | "routes" | "pool" | "upstream" | "about";
+type Tab = "models" | "pool" | "upstream" | "about";
 
 export default function Settings() {
   const { t } = useI18n();
@@ -15,7 +15,6 @@ export default function Settings() {
   const [tab, setTab] = useState<Tab>("models");
   const icons: Record<Tab, React.ReactNode> = {
     models: <Boxes className="h-4 w-4" />,
-    routes: <Route className="h-4 w-4" />,
     pool: <Shuffle className="h-4 w-4" />,
     upstream: <Server className="h-4 w-4" />,
     about: <Info className="h-4 w-4" />,
@@ -29,7 +28,6 @@ export default function Settings() {
       </div>
       <ErrorBox error={error} />
       {tab === "models" && data && <ModelsTab data={data} reload={reload} />}
-      {tab === "routes" && data && <RoutesTab data={data} reload={reload} />}
       {tab === "pool" && <PoolTab />}
       {tab === "upstream" && data && <UpstreamTab data={data} />}
       {tab === "about" && <AboutTab />}
@@ -106,79 +104,6 @@ function ModelsTab({ data, reload }: { data: SettingsData; reload: () => Promise
           );
         })}
         {models.length === 0 && <p className="text-sm text-slate-400">{t("usage.no_data")}</p>}
-      </div>
-    </Card>
-  );
-}
-
-function RoutesTab({ data, reload }: { data: SettingsData; reload: () => Promise<void> }) {
-  const { t } = useI18n();
-  const toast = useToast();
-  const [routes, setRoutes] = useState<ModelRoute[]>(data.model_routes ?? []);
-  const act = useAction();
-  useEffect(() => setRoutes(data.model_routes ?? []), [data]);
-  const presets: ModelRoute[] = [
-    { pattern: "re:^gpt-4o-mini", target: "claude-haiku-4-5" },
-    { pattern: "re:^gpt-4", target: "claude-sonnet-4-5" },
-    { pattern: "re:^o[13]", target: "claude-opus-4-1" },
-  ];
-
-  return (
-    <Card
-      title={t("settings.routes")}
-      icon={<Route className="h-5 w-5 text-violet-500" />}
-      actions={
-        <>
-          <Button onClick={() => setRoutes([...routes, ...presets.filter((p) => !routes.some((r) => r.pattern === p.pattern))])}>{t("settings.add_presets")}</Button>
-          <Button icon={<Plus className="h-4 w-4" />} onClick={() => setRoutes([...routes, { pattern: "", target: "" }])}>
-            {t("settings.add_route")}
-          </Button>
-          <Button
-            tone="primary"
-            icon={<Save className="h-4 w-4" />}
-            disabled={act.busy}
-            onClick={async () => {
-              const r = await act.run(() => post("/settings/model-routes", { routes: routes.filter((r) => r.pattern.trim()) }));
-              if (r !== undefined) toast("success", t("common.saved"));
-              await reload();
-            }}
-          >
-            {t("common.save")}
-          </Button>
-        </>
-      }
-    >
-      <ErrorBox error={act.error} />
-      <p className="mb-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-500 dark:bg-slate-950/50">{t("settings.routes_hint")}</p>
-      <datalist id="ccm-models">
-        {data.models.map((m) => (
-          <option key={m.id} value={m.id} />
-        ))}
-      </datalist>
-      <div className="space-y-2">
-        {routes.map((r, i) => (
-          <div key={i} className="flex items-center gap-2">
-            <span className="w-6 shrink-0 text-center text-xs text-slate-400">{i + 1}</span>
-            <input
-              className={`${inputClass} font-mono`}
-              placeholder="gpt-4o / re:^gpt-"
-              value={r.pattern}
-              onChange={(e) => setRoutes(routes.map((x, j) => (j === i ? { ...x, pattern: e.target.value } : x)))}
-            />
-            <ArrowRight className="h-4 w-4 shrink-0 text-slate-400" />
-            <input
-              className={`${inputClass} font-mono`}
-              placeholder="claude-sonnet-4-5"
-              list="ccm-models"
-              value={r.target}
-              onChange={(e) => setRoutes(routes.map((x, j) => (j === i ? { ...x, target: e.target.value } : x)))}
-            />
-            <IconButton danger title={t("common.delete")} onClick={() => setRoutes(routes.filter((_, j) => j !== i))}>
-              <Trash2 className="h-4 w-4" />
-            </IconButton>
-          </div>
-        ))}
-        {routes.length === 0 && <p className="py-6 text-center text-sm text-slate-400">{t("settings.no_routes")}</p>}
       </div>
     </Card>
   );

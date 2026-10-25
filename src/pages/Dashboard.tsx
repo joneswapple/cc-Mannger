@@ -207,7 +207,7 @@ export default function Dashboard() {
           tone="slate"
           icon={<Server className="h-4 w-4" />}
           label={status.data ? t("dashboard.proxy_desc", { listen: status.data.listen, n: status.data.catalog.models }) : t("dashboard.proxy")}
-          onClick={() => navigate("connect")}
+          onClick={() => navigate("proxy")}
         />
       </div>
 

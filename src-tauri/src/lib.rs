@@ -2,10 +2,11 @@
 //! React UI, and lives in the system tray (current account and quota,
 //! account switching, start/stop, notifications on account trouble).
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ccm_core::{config::Config, events::CoreEvent, Core};
+use ccm_core::{config::Config, events::CoreEvent, Core, ServiceControl};
 use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -19,10 +20,48 @@ use tokio::sync::oneshot;
 /// In-process admin API router, shared by every UI call.
 struct Bridge(axum::Router);
 
-/// The running proxy listener, if any.
+/// The running proxy listener, if any: its generation and stop signal.
+/// A finished listener only clears the slot if it still owns it, so a
+/// restart isn't undone by the old listener shutting down.
 #[derive(Default)]
 struct Proxy {
-    stop: Mutex<Option<oneshot::Sender<()>>>,
+    stop: Mutex<Option<(u64, oneshot::Sender<()>)>>,
+    generation: AtomicU64,
+}
+
+/// Lets the admin API (`/admin/api/service/*`) drive the listener.
+struct DesktopService(AppHandle);
+
+impl ServiceControl for DesktopService {
+    fn start(&self) -> anyhow::Result<()> {
+        start_proxy(&self.0);
+        refresh_tray(&self.0);
+        Ok(())
+    }
+
+    fn stop(&self) -> anyhow::Result<()> {
+        stop_proxy(&self.0);
+        refresh_tray(&self.0);
+        Ok(())
+    }
+
+    fn restart(&self) -> anyhow::Result<()> {
+        stop_proxy(&self.0);
+        let app = self.0.clone();
+        // Give the old listener a moment to release the port.
+        tauri::async_runtime::spawn(async move {
+            let core = app.state::<Core>().inner().clone();
+            for _ in 0..50 {
+                if core.listening().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            start_proxy(&app);
+            refresh_tray(&app);
+        });
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -76,7 +115,8 @@ fn start_proxy(app: &AppHandle) {
         return;
     }
     let (tx, rx) = oneshot::channel::<()>();
-    *stop = Some(tx);
+    let generation = proxy.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    *stop = Some((generation, tx));
     let core = app.state::<Core>().inner().clone();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -89,18 +129,19 @@ fn start_proxy(app: &AppHandle) {
             notify(&handle, "代理启动失败", &format!("{e:#}"));
         }
         // Listener gone (stopped or failed): reflect it in the tray.
-        handle
-            .state::<Proxy>()
-            .stop
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        {
+            let proxy = handle.state::<Proxy>();
+            let mut slot = proxy.stop.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(g, _)| *g == generation) {
+                slot.take();
+            }
+        }
         refresh_tray(&handle);
     });
 }
 
 fn stop_proxy(app: &AppHandle) {
-    if let Some(tx) = app
+    if let Some((_, tx)) = app
         .state::<Proxy>()
         .stop
         .lock()
@@ -148,7 +189,11 @@ fn try_refresh_tray(app: &AppHandle) -> anyhow::Result<()> {
         .count();
 
     let status_text = if running {
-        format!("代理运行中 · {}", core.config.listen)
+        format!(
+            "代理运行中 · {}",
+            core.listening()
+                .unwrap_or_else(|| core.runtime.get().listen)
+        )
     } else {
         "代理已停止".to_string()
     };
@@ -258,6 +303,10 @@ fn on_menu(app: &AppHandle, id: &str) {
     }
 }
 
+fn core_of(app: &AppHandle) -> Core {
+    app.state::<Core>().inner().clone()
+}
+
 fn notify(app: &AppHandle, title: &str, body: &str) {
     if let Err(e) = app.notification().builder().title(title).body(body).show() {
         tracing::warn!("notification: {e}");
@@ -357,7 +406,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     let handle = app.handle().clone();
-    start_proxy(&handle);
+    core_of(&handle).set_service_control(Arc::new(DesktopService(handle.clone())));
+    if core_of(&handle).runtime.get().desktop.auto_start_proxy {
+        start_proxy(&handle);
+    }
     watch_events(handle.clone());
     // Quota and cooldown countdowns change without events; keep the tray
     // roughly current.

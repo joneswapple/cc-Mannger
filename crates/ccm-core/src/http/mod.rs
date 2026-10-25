@@ -2,7 +2,10 @@
 //! registration, and the admin JSON API under `/admin/api`.
 
 mod admin;
+mod ops;
 mod proxy;
+
+pub use ops::LOCAL_CLAUDE_CODE_USER;
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -38,7 +41,9 @@ impl Core {
     pub fn status(&self) -> Result<Status> {
         Ok(Status {
             version: crate::VERSION,
-            listen: self.config.listen.clone(),
+            listen: self
+                .listening()
+                .unwrap_or_else(|| self.runtime.get().listen),
             accounts: self.accounts.count()?,
             upstream: self.pool.source(),
             catalog: self.catalog.status(),
@@ -74,15 +79,24 @@ pub async fn serve_with(
     extra: Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let listen = core.config.listen.clone();
+    let listen = core.runtime.get().listen;
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
+    let bound = listener
+        .local_addr()
+        .map_or(listen.clone(), |a| a.to_string());
     core.start_background();
-    tracing::info!("cc-manager listening on {listen}");
-    axum::serve(listener, router(core).merge(extra))
+    core.set_listening(Some(bound.clone()));
+    tracing::info!("cc-manager listening on {bound}");
+    let app = router(core.clone())
+        .merge(extra)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    core.set_listening(None);
+    result?;
     Ok(())
 }
 
@@ -94,13 +108,14 @@ impl Core {
             self.catalog.start(CATALOG_REFRESH);
             let url = self.config.upstream.usage_url.clone();
             if !url.is_empty() {
-                let every = Duration::from_secs(self.config.upstream.usage_poll_secs.max(60));
                 let upstream = self.upstream.clone();
+                let runtime = self.runtime.clone();
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(every);
                     loop {
-                        tick.tick().await;
                         upstream.probe_usage(&url).await;
+                        // Re-read each round so a settings change applies.
+                        let every = runtime.get().usage_poll_secs.max(60);
+                        tokio::time::sleep(Duration::from_secs(every)).await;
                     }
                 });
             }
@@ -206,6 +221,37 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok().filter(|v| !v.is_empty())
+}
+
+/// The client's IP: the socket peer, or the first `X-Forwarded-For` /
+/// `X-Real-IP` hop when `security.trust_forwarded_for` is on. Empty for
+/// in-process calls.
+pub(crate) struct ClientIp(pub String);
+
+#[axum::async_trait]
+impl FromRequestParts<Core> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, core: &Core) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(client_ip(parts, core)))
+    }
+}
+
+pub(crate) fn client_ip(parts: &Parts, core: &Core) -> String {
+    if core.runtime.get().security.trust_forwarded_for {
+        let forwarded = header(&parts.headers, "x-forwarded-for")
+            .and_then(|v| v.split(',').next())
+            .or_else(|| header(&parts.headers, "x-real-ip"))
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok());
+        if let Some(ip) = forwarded {
+            return ip.to_canonical().to_string();
+        }
+    }
+    parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip().to_canonical().to_string())
+        .unwrap_or_default()
 }
 
 /// The terminal behind an `sk-cp-…` key (`x-api-key` or `Authorization:

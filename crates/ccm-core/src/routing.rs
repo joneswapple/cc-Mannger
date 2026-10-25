@@ -6,6 +6,8 @@
 //! optional "background" rule sends small tool-less requests (titles,
 //! summaries) to a cheaper model.
 
+use std::sync::{Arc, RwLock};
+
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -34,12 +36,23 @@ impl ModelRoute {
 #[derive(Clone)]
 pub struct ModelRouter {
     store: Store,
-    cfg: RoutingConfig,
+    cfg: Arc<RwLock<RoutingConfig>>,
 }
 
 impl ModelRouter {
     pub fn new(store: Store, cfg: RoutingConfig) -> Self {
-        Self { store, cfg }
+        Self {
+            store,
+            cfg: Arc::new(RwLock::new(cfg)),
+        }
+    }
+
+    pub fn config(&self) -> RoutingConfig {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_config(&self, cfg: RoutingConfig) {
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg;
     }
 
     pub fn routes(&self) -> Result<Vec<ModelRoute>> {
@@ -70,7 +83,7 @@ impl ModelRouter {
             return Ok(r.target.clone());
         }
         if self.is_background(body) {
-            return Ok(self.cfg.background_model.clone());
+            return Ok(self.config().background_model);
         }
         Ok(model.to_string())
     }
@@ -78,12 +91,13 @@ impl ModelRouter {
     /// A small request without tools (title generation, quick summaries),
     /// when the background rule is enabled.
     fn is_background(&self, body: &Value) -> bool {
-        if self.cfg.background_model.is_empty() {
+        let cfg = self.config();
+        if cfg.background_model.is_empty() {
             return false;
         }
         let small = body["max_tokens"]
             .as_i64()
-            .is_some_and(|m| m <= self.cfg.background_max_tokens);
+            .is_some_and(|m| m <= cfg.background_max_tokens);
         let no_tools = body
             .get("tools")
             .and_then(Value::as_array)

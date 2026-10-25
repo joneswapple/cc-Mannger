@@ -2,7 +2,7 @@
 //! the upstream throttled or rejected.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -45,7 +45,7 @@ pub struct PickRequest {
 pub struct AccountPool {
     store: AccountStore,
     oauth: OAuthClient,
-    cfg: PoolConfig,
+    cfg: Arc<RwLock<PoolConfig>>,
     providers: Arc<Mutex<HashMap<i64, Arc<AccountProvider>>>>,
     sticky: Arc<Mutex<HashMap<String, (i64, Instant)>>>,
     /// Smooth weighted round-robin state: account id → current weight.
@@ -57,15 +57,20 @@ impl AccountPool {
         Self {
             store,
             oauth,
-            cfg,
+            cfg: Arc::new(RwLock::new(cfg)),
             providers: Default::default(),
             sticky: Default::default(),
             rr: Default::default(),
         }
     }
 
-    pub fn config(&self) -> &PoolConfig {
-        &self.cfg
+    pub fn config(&self) -> PoolConfig {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Applies new scheduling settings to the following picks.
+    pub fn set_config(&self, cfg: PoolConfig) {
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg;
     }
 
     pub fn store(&self) -> &AccountStore {
@@ -117,7 +122,7 @@ impl AccountPool {
         let sticky_key = req
             .sticky_key
             .as_ref()
-            .filter(|_| self.cfg.sticky)
+            .filter(|_| self.config().sticky)
             .map(|k| format!("{}|{k}", req.group.as_deref().unwrap_or("")));
         if let Some(key) = &sticky_key {
             if let Some(id) = self.sticky_lookup(key) {
@@ -126,7 +131,7 @@ impl AccountPool {
                 }
             }
         }
-        let chosen = match self.cfg.strategy {
+        let chosen = match self.config().strategy {
             Strategy::Priority => healthy[0],
             Strategy::RoundRobin => self.round_robin(&healthy),
             Strategy::LeastUsed => self.least_used(&healthy)?,
@@ -145,13 +150,14 @@ impl AccountPool {
         now: i64,
     ) -> Result<Vec<&'a Account>> {
         let quotas = self.store.quotas()?;
+        let limit = self.config().quota_soft_limit;
         let roomy: Vec<&Account> = healthy
             .iter()
             .copied()
             .filter(|a| {
                 quotas
                     .get(&a.id)
-                    .is_none_or(|q| q.effective_utilization(now) < self.cfg.quota_soft_limit)
+                    .is_none_or(|q| q.effective_utilization(now) < limit)
             })
             .collect();
         Ok(if roomy.is_empty() { healthy } else { roomy })
@@ -185,7 +191,7 @@ impl AccountPool {
 
     fn sticky_lookup(&self, key: &str) -> Option<i64> {
         let mut map = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
-        let ttl = Duration::from_secs(self.cfg.sticky_ttl_secs);
+        let ttl = Duration::from_secs(self.config().sticky_ttl_secs);
         match map.get_mut(key) {
             Some((id, seen)) if seen.elapsed() < ttl => {
                 *seen = Instant::now();
@@ -202,7 +208,7 @@ impl AccountPool {
     fn sticky_bind(&self, key: String, id: i64) {
         let mut map = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() > 10_000 {
-            let ttl = Duration::from_secs(self.cfg.sticky_ttl_secs);
+            let ttl = Duration::from_secs(self.config().sticky_ttl_secs);
             map.retain(|_, (_, seen)| seen.elapsed() < ttl);
         }
         map.insert(key, (id, Instant::now()));

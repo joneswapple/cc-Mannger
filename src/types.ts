@@ -152,3 +152,93 @@ export interface Settings {
     effort_levels: Record<string, { max_tokens: number; thinking_budget: number }>;
   };
 }
+
+export interface RuntimeConfig {
+  listen: string;
+  pool: PoolConfig & { quota_soft_limit: number };
+  routing: { background_model: string; background_max_tokens: number };
+  monitor: { enabled: boolean; capacity: number; max_body_bytes: number };
+  security: { block_message: string; trust_forwarded_for: boolean; access_log_days: number };
+  desktop: { auto_start_proxy: boolean };
+  usage_poll_secs: number;
+}
+
+export interface RuntimeView {
+  effective: RuntimeConfig;
+  overrides: Record<string, unknown>;
+  base: RuntimeConfig;
+  restart_required: boolean;
+}
+
+export interface ServiceStatus {
+  running: boolean;
+  bound: string | null;
+  listen: string;
+  restart_required: boolean;
+  controllable: boolean;
+}
+
+export interface FailedAttempt {
+  account_id: number;
+  status: number;
+  error: string;
+  latency_ms: number;
+}
+
+export interface MonitorItem {
+  id: number;
+  ts_ms: number;
+  endpoint: string;
+  client_ip: string;
+  user_id: number;
+  user_label: string;
+  key_prefix: string;
+  model: string;
+  mapped_model: string;
+  stream: boolean;
+  account_id: number | null;
+  status: number;
+  latency_ms: number;
+  ttft_ms: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  failover: FailedAttempt[];
+  error: string;
+}
+
+export interface MonitorDetail extends MonitorItem {
+  request: string;
+  upstream_request: string;
+  response: string;
+  truncated: boolean;
+}
+
+export interface MonitorPage {
+  enabled: boolean;
+  capacity: number;
+  max_body_bytes: number;
+  held: number;
+  items: MonitorItem[];
+}
+
+export interface ModelTest {
+  ok: boolean;
+  model: string;
+  mapped_model: string;
+  status: number;
+  latency_ms: number;
+  account_id?: number;
+  text?: string | null;
+  error?: string;
+  failover: number;
+}
+
+export interface ClaudeCodeStatus {
+  path: string;
+  exists: boolean;
+  base_url: string | null;
+  has_token: boolean;
+  backup: boolean;
+}

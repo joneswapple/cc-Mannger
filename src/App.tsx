@@ -1,10 +1,11 @@
-import { LogOut, Monitor, Moon, Sun } from "lucide-react";
+import { LogOut, Monitor as MonitorIcon, Moon, Sun } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ApiError, get, getToken, isTauri, setToken } from "./api";
 import { LangProvider, useI18n } from "./i18n";
 import Accounts from "./pages/Accounts";
-import Connect from "./pages/Connect";
 import Dashboard from "./pages/Dashboard";
+import Monitor from "./pages/Monitor";
+import Proxy from "./pages/Proxy";
 import Settings from "./pages/Settings";
 import Terminals from "./pages/Terminals";
 import Usage from "./pages/Usage";
@@ -15,16 +16,19 @@ import { Button, ErrorBox, inputClass } from "./ui";
 const PAGES = {
   dashboard: Dashboard,
   accounts: Accounts,
+  proxy: Proxy,
+  monitor: Monitor,
   terminals: Terminals,
   usage: Usage,
   settings: Settings,
-  connect: Connect,
 } as const;
 
 export type PageKey = keyof typeof PAGES;
 
 function pageFromHash(): PageKey {
-  const h = location.hash.replace("#", "").split("?")[0];
+  const raw = location.hash.replace("#", "").split("?")[0];
+  // Older links used #connect for the proxy page.
+  const h = raw === "connect" ? "proxy" : raw;
   return h in PAGES ? (h as PageKey) : "dashboard";
 }
 
@@ -69,7 +73,7 @@ function Shell() {
   if (!authed) return <Login onLogin={() => setAuthed(true)} />;
 
   const Page = PAGES[page];
-  const ThemeIcon = theme.pref === "light" ? Sun : theme.pref === "dark" ? Moon : Monitor;
+  const ThemeIcon = theme.pref === "light" ? Sun : theme.pref === "dark" ? Moon : MonitorIcon;
   const roundBtn =
     "inline-flex h-10 w-10 items-center justify-center rounded-full bg-white text-sm font-semibold text-slate-600 shadow-sm ring-1 ring-slate-200 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-300 dark:ring-slate-800 dark:hover:bg-slate-800";
   return (

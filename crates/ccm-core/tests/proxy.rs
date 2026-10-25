@@ -166,6 +166,11 @@ async fn harness() -> Harness {
     cfg.upstream.profile_url = format!("http://{addr}/api/oauth/profile");
     cfg.upstream.user_agent = "test-ua".into();
     cfg.upstream.anthropic_beta = "test-beta".into();
+    cfg.claude_settings_path = dir
+        .path()
+        .join("home/.claude/settings.json")
+        .to_string_lossy()
+        .into_owned();
     let (core, startup) = Core::open(cfg).unwrap();
     assert!(startup.imported_account.is_some());
     core.catalog.refresh().await.unwrap();
@@ -1450,4 +1455,282 @@ async fn export_round_trips_through_import_and_tracks_last_used() {
         .await;
     assert_eq!(status, 200, "{r}");
     assert_eq!(r["imported"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn monitor_records_bodies_mapping_streams_and_rejections() {
+    let h = harness().await;
+    // Off by default: nothing is kept.
+    h.messages(r#"{"model":"claude-test"}"#, &[]).await;
+    let (_, m) = h.admin("GET", "/admin/api/monitor", None).await;
+    assert_eq!(
+        (m["enabled"].clone(), m["held"].clone()),
+        (json!(false), json!(0))
+    );
+
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/runtime",
+            Some(json!({"monitor": {"enabled": true, "max_body_bytes": 4096}})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/settings/model-routes",
+            Some(json!({"routes": [{"pattern": "claude-alias", "target": "claude-test"}]})),
+        )
+        .await;
+    assert_eq!(s, 204);
+
+    let (status, _, _) = h
+        .messages(r#"{"model":"claude-alias","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}"#, &[])
+        .await;
+    assert_eq!(status, 200);
+    let (_, m) = h.admin("GET", "/admin/api/monitor", None).await;
+    let item = &m["items"][0];
+    assert_eq!(item["model"], "claude-alias");
+    assert_eq!(item["mapped_model"], "claude-test");
+    assert_eq!(item["status"], 200);
+    assert_eq!(item["input_tokens"], 7);
+    assert_eq!(item["user_label"], "alice");
+    assert!(item["account_id"].as_i64().is_some());
+    assert!(item["ttft_ms"].as_i64().is_some());
+    assert!(item.get("request").is_none(), "list has no bodies");
+    let id = item["id"].as_u64().unwrap();
+    let (_, d) = h
+        .admin("GET", &format!("/admin/api/monitor/{id}"), None)
+        .await;
+    assert!(d["request"].as_str().unwrap().contains("claude-alias"));
+    let up = d["upstream_request"].as_str().unwrap();
+    assert!(
+        up.contains("\"claude-test\"") && up.contains("Claude Code"),
+        "routed and injected: {up}"
+    );
+    assert!(d["response"].as_str().unwrap().contains("msg_1"));
+
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+    );
+    h.set_reply(Reply::Sse(sse));
+    h.messages(r#"{"model":"claude-test","stream":true}"#, &[])
+        .await;
+    let (_, m) = h
+        .admin("GET", &format!("/admin/api/monitor?after_id={id}"), None)
+        .await;
+    assert_eq!(m["items"].as_array().unwrap().len(), 1);
+    let sid = m["items"][0]["id"].as_u64().unwrap();
+    assert_eq!(m["items"][0]["stream"], true);
+    assert_eq!(m["items"][0]["output_tokens"], 5);
+    let (_, d) = h
+        .admin("GET", &format!("/admin/api/monitor/{sid}"), None)
+        .await;
+    assert!(d["response"]
+        .as_str()
+        .unwrap()
+        .starts_with("event: message_start"));
+
+    // A policy rejection never reaches upstream but is still monitored.
+    h.admin(
+        "POST",
+        "/admin/api/settings/disabled-models",
+        Some(json!({"models": ["claude-test"]})),
+    )
+    .await;
+    let (status, _, _) = h.messages(r#"{"model":"claude-test"}"#, &[]).await;
+    assert_eq!(status, 403);
+    let (_, m) = h
+        .admin("GET", "/admin/api/monitor?status=error", None)
+        .await;
+    assert_eq!(m["items"].as_array().unwrap().len(), 1);
+    assert_eq!(m["items"][0]["status"], 403);
+    assert!(m["items"][0]["account_id"].is_null());
+
+    let (s, _) = h.admin("POST", "/admin/api/monitor/clear", None).await;
+    assert_eq!(s, 204);
+    let (_, m) = h.admin("GET", "/admin/api/monitor", None).await;
+    assert_eq!(m["held"], 0);
+}
+
+#[tokio::test]
+async fn runtime_settings_apply_live_and_validate() {
+    let h = harness().await;
+    let (_, r) = h.admin("GET", "/admin/api/runtime", None).await;
+    assert_eq!(r["effective"]["pool"]["max_retries"], 2);
+    assert_eq!(r["overrides"], json!({}));
+    let (s, r) = h
+        .admin(
+            "POST",
+            "/admin/api/runtime",
+            Some(json!({"pool": {"max_retries": 0, "strategy": "round_robin"}})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(r["overrides"]["pool"]["max_retries"], 0);
+    assert_eq!(h.core.pool.config().max_retries, 0);
+
+    // With no retries a 429 is not failed over.
+    let second = h.add_account("b", "b-tok", 0, "");
+    h.reply_for(
+        "upstream-access",
+        Reply::Json(
+            429,
+            vec![],
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"x"}}"#,
+        ),
+    );
+    h.admin(
+        "POST",
+        "/admin/api/runtime",
+        Some(json!({"pool": {"strategy": "priority"}})),
+    )
+    .await;
+    h.core.accounts.pin(1).unwrap();
+    let (status, _, _) = h.messages(r#"{"model":"claude-test"}"#, &[]).await;
+    assert_eq!(status, 429);
+    assert!(
+        !h.tokens_seen().contains(&"b-tok".to_string()),
+        "account #{second} untouched"
+    );
+
+    for bad in [
+        json!({"pool": {"max_retry": 1}}),
+        json!({"listen": "not an address"}),
+        json!({"monitor": {"capacity": 0}}),
+    ] {
+        let (s, e) = h.admin("POST", "/admin/api/runtime", Some(bad)).await;
+        assert_eq!(s, 400, "{e}");
+    }
+    // A null resets to the config value.
+    h.admin(
+        "POST",
+        "/admin/api/runtime",
+        Some(json!({"pool": {"max_retries": null}})),
+    )
+    .await;
+    assert_eq!(h.core.pool.config().max_retries, 2);
+
+    // The headless router has no listener controls.
+    let (_, svc) = h.admin("GET", "/admin/api/service", None).await;
+    assert_eq!(
+        (svc["running"].clone(), svc["controllable"].clone()),
+        (json!(false), json!(false))
+    );
+    let (s, _) = h.admin("POST", "/admin/api/service/stop", None).await;
+    assert_eq!(s, 400);
+}
+
+#[tokio::test]
+async fn model_test_goes_through_the_pool_without_stats() {
+    let h = harness().await;
+    h.set_reply(Reply::Json(
+        200,
+        vec![],
+        r#"{"id":"m","content":[{"type":"text","text":"pong"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+    ));
+    let (s, r) = h
+        .admin(
+            "POST",
+            "/admin/api/proxy/test",
+            Some(json!({"model": "claude-test"})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        (r["ok"].clone(), r["status"].clone(), r["text"].clone()),
+        (json!(true), json!(200), json!("pong"))
+    );
+    assert_eq!(r["account_id"], 1);
+    assert!(String::from_utf8_lossy(&h.last_seen("/v1/messages").body).contains("Claude Code"));
+
+    h.set_reply(Reply::Json(
+        400,
+        vec![],
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"no such model"}}"#,
+    ));
+    let (_, r) = h
+        .admin(
+            "POST",
+            "/admin/api/proxy/test",
+            Some(json!({"model": "nope"})),
+        )
+        .await;
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().unwrap().contains("no such model"));
+    h.core.recorder.flush();
+    let (_, total) = h.core.recorder.search(&SearchFilter::default()).unwrap();
+    assert_eq!(total, 0, "tests are not usage");
+}
+
+async fn bearer_status(h: &Harness, token: &str) -> StatusCode {
+    let req = Request::post("/v1/messages")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(r#"{"model":"claude-test"}"#))
+        .unwrap();
+    h.call(req).await.0
+}
+
+#[tokio::test]
+async fn claude_code_sync_writes_a_working_key_and_restores() {
+    let h = harness().await;
+    let (_, st) = h.admin("GET", "/admin/api/claude-code", None).await;
+    assert_eq!(
+        (st["exists"].clone(), st["backup"].clone()),
+        (json!(false), json!(false))
+    );
+
+    let token_in_file = || {
+        let path = h.core.config.claude_settings_path.clone();
+        let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        v["env"]["ANTHROPIC_AUTH_TOKEN"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let (s, st) = h
+        .admin(
+            "POST",
+            "/admin/api/claude-code/sync",
+            Some(json!({"base_url": "http://127.0.0.1:8787"})),
+        )
+        .await;
+    assert_eq!(s, 200, "{st}");
+    assert_eq!(st["base_url"], "http://127.0.0.1:8787");
+    assert!(st.get("token").is_none(), "the key is never returned");
+    let first = token_in_file();
+    assert!(first.starts_with("sk-cp-"));
+    assert_eq!(bearer_status(&h, &first).await, 200);
+
+    // Re-syncing rotates the key.
+    h.admin(
+        "POST",
+        "/admin/api/claude-code/sync",
+        Some(json!({"base_url": "http://127.0.0.1:8787"})),
+    )
+    .await;
+    let second = token_in_file();
+    assert_ne!(first, second);
+    assert_eq!(bearer_status(&h, &first).await, 401);
+    assert_eq!(bearer_status(&h, &second).await, 200);
+
+    let (s, st) = h
+        .admin("POST", "/admin/api/claude-code/restore", None)
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(st["exists"], false);
+    assert_eq!(
+        bearer_status(&h, &second).await,
+        401,
+        "restore revokes the local key"
+    );
+    let (s, _) = h
+        .admin("POST", "/admin/api/claude-code/restore", None)
+        .await;
+    assert_eq!(s, 400);
 }

@@ -115,8 +115,19 @@ pub fn write_credentials_file(path: &Path, c: &Credentials) -> Result<()> {
     let body = serde_json::to_vec_pretty(&CredsFile {
         claude_ai_oauth: c.clone(),
     })?;
+    write_private_atomic(path, &body)
+        .with_context(|| format!("write credentials {}", path.display()))
+}
+
+/// Writes `body` to a temp file (0600) next to `path`, then renames it
+/// over `path`.
+pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".credentials-{}.tmp", std::process::id()));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}-{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -126,7 +137,7 @@ pub fn write_credentials_file(path: &Path, c: &Credentials) -> Result<()> {
             opts.mode(0o600);
         }
         let mut f = opts.open(&tmp)?;
-        f.write_all(&body)?;
+        f.write_all(body)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -134,7 +145,7 @@ pub fn write_credentials_file(path: &Path, c: &Credentials) -> Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result.with_context(|| format!("write credentials {}", path.display()))
+    result
 }
 
 #[derive(Serialize)]

@@ -58,12 +58,63 @@ pub enum AdminCommand {
         #[arg(long, default_value_t = 50)]
         page_size: i64,
     },
+    /// Show runtime settings, or apply a JSON merge patch to them
+    /// (e.g. '{"pool":{"strategy":"least_used"}}'; null resets a field).
+    Settings { patch: Option<String> },
+    /// Proxy listener status, or start / stop / restart it (desktop app only).
+    Service {
+        #[arg(value_parser = ["status", "start", "stop", "restart"], default_value = "status")]
+        action: String,
+    },
+    #[command(subcommand)]
+    Monitor(MonitorCommand),
+    /// Send a tiny request to a model through the pool (connectivity test).
+    TestModel { model: String },
+    #[command(subcommand)]
+    ClaudeCode(ClaudeCodeCommand),
     /// Reset the admin token in the local database (no server needed).
     ResetToken {
         /// Explicit token to install (default: random).
         #[arg(long)]
         token: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum MonitorCommand {
+    /// Recent requests (newest first).
+    List {
+        #[arg(long)]
+        q: Option<String>,
+        /// ok | error | <code>
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// One request with its bodies.
+    Show {
+        id: u64,
+    },
+    /// Start recording requests.
+    On,
+    /// Stop recording requests.
+    Off,
+    Clear,
+}
+
+/// The server machine's `~/.claude/settings.json`.
+#[derive(Subcommand)]
+pub enum ClaudeCodeCommand {
+    Status,
+    /// Point Claude Code at this server (issues a key for it).
+    Sync {
+        /// URL Claude Code should use, e.g. http://127.0.0.1:8787.
+        #[arg(long)]
+        base_url: String,
+    },
+    /// Put the original settings file back.
+    Restore,
 }
 
 #[derive(Subcommand)]
@@ -411,6 +462,56 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             query.extend(model.map(|v| ("model", v)));
             query.extend(status.map(|v| ("status", v)));
             c.get_query("/admin/api/usage", &query).await?
+        }
+        AdminCommand::Settings { patch: None } => c.get("/admin/api/runtime").await?,
+        AdminCommand::Settings { patch: Some(p) } => {
+            let patch: Value = serde_json::from_str(&p).context("patch must be JSON")?;
+            c.post("/admin/api/runtime", patch).await?
+        }
+        AdminCommand::Service { action } => match action.as_str() {
+            "status" => c.get("/admin/api/service").await?,
+            a => {
+                c.post(&format!("/admin/api/service/{a}"), Value::Null)
+                    .await?
+            }
+        },
+        AdminCommand::Monitor(MonitorCommand::List { q, status, limit }) => {
+            let mut query = vec![("limit", limit.to_string())];
+            query.extend(q.map(|v| ("q", v)));
+            query.extend(status.map(|v| ("status", v)));
+            c.get_query("/admin/api/monitor", &query).await?
+        }
+        AdminCommand::Monitor(MonitorCommand::Show { id }) => {
+            c.get(&format!("/admin/api/monitor/{id}")).await?
+        }
+        AdminCommand::Monitor(MonitorCommand::On) => {
+            c.post("/admin/api/runtime", json!({"monitor": {"enabled": true}}))
+                .await?
+        }
+        AdminCommand::Monitor(MonitorCommand::Off) => {
+            c.post("/admin/api/runtime", json!({"monitor": {"enabled": false}}))
+                .await?
+        }
+        AdminCommand::Monitor(MonitorCommand::Clear) => {
+            c.post("/admin/api/monitor/clear", Value::Null).await?
+        }
+        AdminCommand::TestModel { model } => {
+            c.post("/admin/api/proxy/test", json!({ "model": model }))
+                .await?
+        }
+        AdminCommand::ClaudeCode(ClaudeCodeCommand::Status) => {
+            c.get("/admin/api/claude-code").await?
+        }
+        AdminCommand::ClaudeCode(ClaudeCodeCommand::Sync { base_url }) => {
+            c.post(
+                "/admin/api/claude-code/sync",
+                json!({ "base_url": base_url }),
+            )
+            .await?
+        }
+        AdminCommand::ClaudeCode(ClaudeCodeCommand::Restore) => {
+            c.post("/admin/api/claude-code/restore", Value::Null)
+                .await?
         }
         AdminCommand::ResetToken { .. } => unreachable!("handled locally"),
     };

@@ -12,9 +12,10 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{anthropic_error, header, ApiIdentity};
+use super::{anthropic_error, header, ApiIdentity, ClientIp};
 use crate::auth::Identity;
 use crate::capture::{Captured, TeeStream};
+use crate::monitor::{self, Bodies, Monitor, RequestMeta};
 use crate::policy::Denied;
 use crate::pool::{AllCooling, NoAccount, PickRequest};
 use crate::stats::Event;
@@ -27,6 +28,8 @@ use futures_util::StreamExt;
 struct MessageRequest {
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    stream: Option<bool>,
     #[serde(default)]
     metadata: Option<Metadata>,
 }
@@ -46,40 +49,75 @@ fn sticky_key(req: &MessageRequest, id: &Identity) -> String {
     }
 }
 
-/// Client-facing response when no upstream answer can be forwarded.
-fn forward_error(e: &ForwardError) -> Response {
+/// A request turned away before (or instead of) forwarding an upstream
+/// answer. Becomes an Anthropic-shaped error response.
+struct Reject {
+    status: StatusCode,
+    kind: &'static str,
+    message: String,
+    retry_after: Option<i64>,
+}
+
+impl Reject {
+    fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            kind,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    fn internal(e: impl std::fmt::Display) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            e.to_string(),
+        )
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+    }
+
+    fn into_response(self) -> Response {
+        let mut resp = anthropic_error(self.status, self.kind, self.message);
+        if let Some(v) = self.retry_after.and_then(|r| r.to_string().parse().ok()) {
+            resp.headers_mut().insert("retry-after", v);
+        }
+        resp
+    }
+}
+
+/// Client-facing error when no upstream answer can be forwarded.
+fn forward_error(e: &ForwardError) -> Reject {
     match e {
         ForwardError::Pick(err) => {
             if let Some(c) = err.downcast_ref::<AllCooling>() {
-                let mut resp = anthropic_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limit_error",
-                    c.to_string(),
-                );
-                if let Ok(v) = c.retry_after.to_string().parse() {
-                    resp.headers_mut().insert("retry-after", v);
+                Reject {
+                    retry_after: Some(c.retry_after),
+                    ..Reject::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        c.to_string(),
+                    )
                 }
-                resp
             } else if err.is::<NoAccount>() {
-                anthropic_error(
+                Reject::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
                     format!("upstream: {err}"),
                 )
             } else {
-                anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!("{err:#}"),
-                )
+                Reject::internal(format!("{err:#}"))
             }
         }
-        ForwardError::Exhausted { last, .. } => anthropic_error(
+        ForwardError::Exhausted { last, .. } => Reject::new(
             StatusCode::BAD_GATEWAY,
             "api_error",
             format!("upstream: {}", last.error),
         ),
-        ForwardError::Response(_) => internal("unforwarded upstream response"),
+        ForwardError::Response(_) => Reject::internal("unforwarded upstream response"),
     }
 }
 
@@ -106,7 +144,7 @@ fn forward_extra(headers: &HeaderMap) -> ForwardExtra {
 
 /// Prepends the Claude Code system block when enabled; a body that can't be
 /// rewritten is forwarded as is.
-fn maybe_inject(core: &Core, body: Bytes) -> Bytes {
+pub(super) fn maybe_inject(core: &Core, body: Bytes) -> Bytes {
     if !core.config.upstream.inject_claude_code_system {
         return body;
     }
@@ -138,40 +176,148 @@ fn response_head(resp: &reqwest::Response) -> axum::http::response::Builder {
     b
 }
 
+/// Where a request came from, for the monitor.
+struct Origin {
+    endpoint: &'static str,
+    ip: String,
+    /// The body as the client sent it (before any translation).
+    body: Bytes,
+}
+
+/// A monitor entry being filled in while a request is handled.
+struct Draft {
+    meta: RequestMeta,
+    bodies: Bodies,
+    limit: usize,
+    arrived: Instant,
+}
+
+impl Draft {
+    fn new(core: &Core, id: &Identity, origin: &Origin, model: &str, stream: bool) -> Option<Self> {
+        let limit = core.monitor.body_limit()?;
+        let (request, truncated) = monitor::body_text(&origin.body, limit);
+        Some(Draft {
+            meta: RequestMeta {
+                ts_ms: crate::now_millis(),
+                endpoint: origin.endpoint.into(),
+                client_ip: origin.ip.clone(),
+                user_id: id.user_id,
+                user_label: id.user_label.clone(),
+                key_prefix: id.key_prefix.clone(),
+                model: model.into(),
+                mapped_model: model.into(),
+                stream,
+                ..Default::default()
+            },
+            bodies: Bodies {
+                request,
+                truncated,
+                ..Default::default()
+            },
+            limit,
+            arrived: Instant::now(),
+        })
+    }
+
+    fn set_upstream_body(&mut self, body: &[u8]) {
+        let (text, cut) = monitor::body_text(body, self.limit);
+        self.bodies.upstream_request = text;
+        self.bodies.truncated |= cut;
+    }
+
+    fn reject(mut self, core: &Core, r: &Reject) {
+        self.meta.status = r.status.as_u16();
+        self.meta.error = r.message.clone();
+        self.meta.latency_ms = self.arrived.elapsed().as_millis() as i64;
+        core.monitor.record(self.meta, self.bodies);
+    }
+
+    fn finish(
+        mut self,
+        monitor: &Monitor,
+        status: u16,
+        c: &Captured,
+        error: String,
+        headers_at: Instant,
+    ) {
+        let m = &mut self.meta;
+        m.status = status;
+        m.error = error;
+        m.latency_ms = self.arrived.elapsed().as_millis() as i64;
+        m.ttft_ms = Some(
+            c.first_chunk
+                .unwrap_or(headers_at)
+                .saturating_duration_since(self.arrived)
+                .as_millis() as i64,
+        );
+        m.input_tokens = c.usage.input_tokens;
+        m.output_tokens = c.usage.output_tokens;
+        m.cache_read_tokens = c.usage.cache_read_input_tokens;
+        m.cache_creation_tokens = c.usage.cache_creation_input_tokens;
+        let (text, cut) = monitor::body_text(&c.body, self.limit);
+        self.bodies.response = text;
+        self.bodies.truncated |= cut || c.body.len() >= self.limit;
+        monitor.record(self.meta, self.bodies);
+    }
+}
+
 /// An upstream answer to a messages call, plus the hook that records it
 /// once the body has been consumed.
 struct Dispatched {
     resp: reqwest::Response,
     status: u16,
     finish: Box<dyn FnOnce(Captured) + Send>,
+    /// Bytes of the response body to capture for the monitor (0 = none).
+    keep: usize,
 }
 
 /// The shared `/v1/messages` pipeline: model routing, effort tiers, policy,
 /// system injection, failover forwarding, and stats for failed attempts.
-/// Errors are client-ready Anthropic-shaped responses.
+/// Errors are client-ready Anthropic-shaped responses; every outcome is
+/// also offered to the request monitor.
 async fn dispatch(
     core: &Core,
     id: Identity,
+    origin: Origin,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Dispatched, Response> {
-    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("parse body: {e}"),
-        )
-    })?;
+    let mut draft = None;
+    match dispatch_inner(core, id, &origin, headers, body, &mut draft).await {
+        Ok(d) => Ok(d),
+        Err(r) => {
+            if let Some(d) = draft {
+                d.reject(core, &r);
+            }
+            Err(r.into_response())
+        }
+    }
+}
+
+async fn dispatch_inner(
+    core: &Core,
+    id: Identity,
+    origin: &Origin,
+    headers: &HeaderMap,
+    body: Bytes,
+    draft: &mut Option<Draft>,
+) -> Result<Dispatched, Reject> {
+    let mut value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Reject::bad_request(format!("parse body: {e}")))?;
     let parsed: MessageRequest = serde_json::from_value(value.clone()).unwrap_or(MessageRequest {
         model: String::new(),
+        stream: None,
         metadata: None,
     });
+    *draft = Draft::new(
+        core,
+        &id,
+        origin,
+        &parsed.model,
+        parsed.stream.unwrap_or(false),
+    );
     if parsed.model.is_empty() {
-        return Err(anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "model is required",
-        ));
+        return Err(Reject::bad_request("model is required"));
     }
     let sticky = sticky_key(&parsed, &id);
 
@@ -179,10 +325,13 @@ async fn dispatch(
     let model = core
         .routing
         .resolve(&parsed.model, &value)
-        .map_err(|e| internal(format!("routing: {e:#}")))?;
+        .map_err(|e| Reject::internal(format!("routing: {e:#}")))?;
+    if let Some(d) = draft.as_mut() {
+        d.meta.mapped_model = model.clone();
+    }
     let body = if model != parsed.model {
         value["model"] = serde_json::json!(model);
-        Bytes::from(serde_json::to_vec(&value).map_err(internal)?)
+        Bytes::from(serde_json::to_vec(&value).map_err(Reject::internal)?)
     } else {
         body
     };
@@ -191,13 +340,7 @@ async fn dispatch(
     let body = match rewrite::apply_effort(&body, &core.config.upstream.effort_levels) {
         Ok(Some(b)) => Bytes::from(b),
         Ok(None) => body,
-        Err(e) => {
-            return Err(anthropic_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                e.to_string(),
-            ))
-        }
+        Err(e) => return Err(Reject::bad_request(e.to_string())),
     };
 
     let policy = match core.policy.check(id.user_id, &model) {
@@ -211,12 +354,15 @@ async fn dispatch(
                     (StatusCode::FORBIDDEN, "permission_error")
                 }
             };
-            return Err(anthropic_error(status, kind, denied.to_string()));
+            return Err(Reject::new(status, kind, denied.to_string()));
         }
-        Err(e) => return Err(internal(format!("policy: {e:#}"))),
+        Err(e) => return Err(Reject::internal(format!("policy: {e:#}"))),
     };
 
     let body = maybe_inject(core, body);
+    if let Some(d) = draft.as_mut() {
+        d.set_upstream_body(&body);
+    }
     let start = Instant::now();
     let event = move |account_id: i64, status: u16, c: &Captured, error: String| Event {
         ts: crate::now_unix(),
@@ -249,7 +395,8 @@ async fn dispatch(
         )
         .await
         .or_else(ForwardError::into_forwarded);
-    for a in failed_attempts(&result) {
+    let failed = failed_attempts(&result);
+    for a in &failed {
         core.recorder.record(Event {
             latency_ms: a.latency_ms,
             ..event(
@@ -260,9 +407,14 @@ async fn dispatch(
             )
         });
     }
+    if let Some(d) = draft.as_mut() {
+        d.meta.account_id = failed.last().map(|a| a.account_id);
+        d.meta.failover = failed;
+    }
     let Forwarded {
         resp, account_id, ..
     } = result.map_err(|e| forward_error(&e))?;
+    let headers_at = Instant::now();
     let status = resp.status().as_u16();
     let header_str = |k: &str| {
         resp.headers()
@@ -275,7 +427,13 @@ async fn dispatch(
     let retry_after = header_str("retry-after");
 
     let recorder = core.recorder.clone();
+    let monitor = core.monitor.clone();
     let user = id_summary(&id);
+    let mut draft = draft.take();
+    if let Some(d) = draft.as_mut() {
+        d.meta.account_id = Some(account_id);
+    }
+    let keep = draft.as_ref().map_or(0, |d| d.limit);
     let finish = move |mut c: Captured| {
         if c.request_id.is_empty() {
             c.request_id = request_id_hdr;
@@ -289,12 +447,16 @@ async fn dispatch(
                 c.error_message
             );
         }
-        recorder.record(event(account_id, status, &c, summary));
+        recorder.record(event(account_id, status, &c, summary.clone()));
+        if let Some(d) = draft {
+            d.finish(&monitor, status, &c, summary, headers_at);
+        }
     };
     Ok(Dispatched {
         resp,
         status,
         finish: Box::new(finish),
+        keep,
     })
 }
 
@@ -309,7 +471,9 @@ fn is_sse(resp: &reqwest::Response) -> bool {
 async fn buffered(d: Dispatched) -> Result<Bytes, Response> {
     match d.resp.bytes().await {
         Ok(buf) => {
-            (d.finish)(Captured::from_json(&buf));
+            let mut c = Captured::from_json(&buf);
+            c.body = buf[..buf.len().min(d.keep)].to_vec();
+            (d.finish)(c);
             Ok(buf)
         }
         Err(e) => {
@@ -329,16 +493,22 @@ async fn buffered(d: Dispatched) -> Result<Bytes, Response> {
 pub(super) async fn messages(
     State(core): State<Core>,
     ApiIdentity(id): ApiIdentity,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let d = match dispatch(&core, id, &headers, body).await {
+    let origin = Origin {
+        endpoint: "/v1/messages",
+        ip,
+        body: body.clone(),
+    };
+    let d = match dispatch(&core, id, origin, &headers, body).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
     let head = response_head(&d.resp);
     if is_sse(&d.resp) {
-        let stream = TeeStream::new(Box::pin(d.resp.bytes_stream()), d.finish);
+        let stream = TeeStream::new(Box::pin(d.resp.bytes_stream()), d.finish).keep_body(d.keep);
         return head
             .body(Body::from_stream(stream))
             .unwrap_or_else(internal);
@@ -355,9 +525,15 @@ pub(super) async fn messages(
 pub(super) async fn chat_completions(
     State(core): State<Core>,
     ApiIdentity(id): ApiIdentity,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let origin = Origin {
+        endpoint: "/v1/chat/completions",
+        ip,
+        body: body.clone(),
+    };
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -387,7 +563,7 @@ pub(super) async fn chat_completions(
     if let Some(ua) = headers.get("user-agent") {
         fwd_headers.insert("user-agent", ua.clone());
     }
-    let d = match dispatch(&core, id, &fwd_headers, body).await {
+    let d = match dispatch(&core, id, origin, &fwd_headers, body).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -406,6 +582,7 @@ pub(super) async fn chat_completions(
     if is_sse(&d.resp) {
         let mut translator = openai::StreamTranslator::new(info);
         let stream = TeeStream::new(Box::pin(d.resp.bytes_stream()), d.finish)
+            .keep_body(d.keep)
             .map(move |chunk| chunk.map(|b| Bytes::from(translator.feed(&b))));
         return Response::builder()
             .header("content-type", "text/event-stream")
@@ -479,7 +656,7 @@ pub(super) async fn count_tokens(
         .or_else(ForwardError::into_forwarded)
     {
         Ok(f) => f.resp,
-        Err(e) => return forward_error(&e),
+        Err(e) => return forward_error(&e).into_response(),
     };
     let head = response_head(&resp);
     match resp.bytes().await {
@@ -517,4 +694,55 @@ pub(super) async fn models(State(core): State<Core>, ApiIdentity(_): ApiIdentity
         })
         .collect();
     Json(json!({"object": "list", "data": data, "has_more": false})).into_response()
+}
+
+/// Admin connectivity test: one tiny request to `model` through the same
+/// routing, system injection, pool and failover as terminal traffic. Not
+/// recorded in usage stats or the monitor.
+pub(super) async fn probe_model(core: &Core, model: &str) -> serde_json::Value {
+    let start = Instant::now();
+    let mut req = json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "Reply with the single word: pong"}],
+    });
+    let mapped = core
+        .routing
+        .resolve(model, &req)
+        .unwrap_or_else(|_| model.to_string());
+    req["model"] = json!(mapped);
+    let body = maybe_inject(core, Bytes::from(req.to_string()));
+    let result = core
+        .upstream
+        .forward(
+            &PickRequest::default(),
+            Method::POST,
+            "/v1/messages",
+            Some(body),
+            &ForwardExtra::default(),
+        )
+        .await
+        .or_else(ForwardError::into_forwarded);
+    let failover = failed_attempts(&result).len();
+    let mut out = json!({"model": model, "mapped_model": mapped, "failover": failover});
+    match result {
+        Ok(f) => {
+            let status = f.resp.status().as_u16();
+            let buf = f.resp.bytes().await.unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
+            out["ok"] = json!(status < 400);
+            out["status"] = json!(status);
+            out["account_id"] = json!(f.account_id);
+            out["text"] = v["content"][0]["text"].clone();
+            out["error"] = json!(Captured::from_json(&buf).error_summary(status));
+        }
+        Err(e) => {
+            let r = forward_error(&e);
+            out["ok"] = json!(false);
+            out["status"] = json!(r.status.as_u16());
+            out["error"] = json!(r.message);
+        }
+    }
+    out["latency_ms"] = json!(start.elapsed().as_millis() as i64);
+    out
 }

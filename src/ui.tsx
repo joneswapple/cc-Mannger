@@ -90,7 +90,7 @@ export function IconButton({
 
 export type BadgeTone = "slate" | "green" | "yellow" | "red" | "blue" | "purple";
 
-export function Badge({ tone = "slate", children, icon }: { tone?: BadgeTone; children: ReactNode; icon?: ReactNode }) {
+export function Badge({ tone = "slate", children, icon, title }: { tone?: BadgeTone; children: ReactNode; icon?: ReactNode; title?: string }) {
   const c = {
     slate: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
     green: "bg-green-50 text-green-700 ring-1 ring-green-200 dark:bg-green-950 dark:text-green-300 dark:ring-green-900",
@@ -100,7 +100,7 @@ export function Badge({ tone = "slate", children, icon }: { tone?: BadgeTone; ch
     purple: "bg-violet-50 text-violet-600 ring-1 ring-violet-200 dark:bg-violet-950 dark:text-violet-300 dark:ring-violet-900",
   }[tone];
   return (
-    <span className={`inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-xs font-medium ${c}`}>
+    <span title={title} className={`inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-xs font-medium ${c}`}>
       {icon}
       {children}
     </span>
@@ -367,4 +367,34 @@ export function useAction() {
     }
   }, []);
   return { busy, error, run, setError };
+}
+
+/// On/off toggle.
+export function Switch({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${checked ? "bg-blue-500" : "bg-slate-300 dark:bg-slate-700"}`}
+    >
+      <span className={`inline-block h-5 w-5 rounded-full bg-white shadow transition-transform ${checked ? "translate-x-5" : "translate-x-0.5"}`} />
+    </button>
+  );
+}
+
+/// A labelled row with a control on the right (settings lists).
+export function SettingRow({ title, hint, children }: { title: ReactNode; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 py-3">
+      <div className="min-w-0">
+        <div className="text-sm font-medium">{title}</div>
+        {hint && <div className="text-xs text-slate-500">{hint}</div>}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">{children}</div>
+    </div>
+  );
 }

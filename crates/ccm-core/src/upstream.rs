@@ -269,7 +269,7 @@ fn finish_without_pick(
 }
 
 /// One upstream attempt that did not produce the final answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Attempt {
     pub account_id: i64,
     /// HTTP status, or 502 for a transport / token failure.

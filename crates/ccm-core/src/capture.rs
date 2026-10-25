@@ -23,6 +23,10 @@ pub struct Captured {
     pub error_type: String,
     pub error_message: String,
     pub request_id: String,
+    /// The first bytes of the body, when a body limit was set (monitor).
+    pub body: Vec<u8>,
+    /// When the first body chunk arrived (streams only).
+    pub first_chunk: Option<std::time::Instant>,
 }
 
 #[derive(Deserialize, Default)]
@@ -184,6 +188,8 @@ pub struct TeeStream {
     inner: ByteStream,
     sse: SseCapture,
     on_done: Option<Box<dyn FnOnce(Captured) + Send>>,
+    /// Bytes of the body to keep in `Captured::body`.
+    keep: usize,
 }
 
 impl TeeStream {
@@ -192,7 +198,14 @@ impl TeeStream {
             inner,
             sse: SseCapture::default(),
             on_done: Some(Box::new(on_done)),
+            keep: 0,
         }
+    }
+
+    /// Also keeps up to `limit` bytes of the body for the caller.
+    pub fn keep_body(mut self, limit: usize) -> Self {
+        self.keep = limit;
+        self
     }
 
     fn done(&mut self) {
@@ -210,6 +223,13 @@ impl Stream for TeeStream {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.sse.feed(&chunk);
+                let c = &mut self.sse.captured;
+                c.first_chunk.get_or_insert_with(std::time::Instant::now);
+                let room = self.keep.saturating_sub(self.sse.captured.body.len());
+                if room > 0 {
+                    let n = room.min(chunk.len());
+                    self.sse.captured.body.extend_from_slice(&chunk[..n]);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {

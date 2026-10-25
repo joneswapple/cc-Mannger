@@ -4,11 +4,13 @@
 pub mod accounts;
 pub mod auth;
 pub mod capture;
+pub mod claude_code;
 pub mod config;
 pub mod events;
 pub mod http;
 pub mod login;
 mod metrics;
+pub mod monitor;
 pub mod oauth;
 mod onboard;
 pub mod openai;
@@ -18,6 +20,7 @@ pub mod provider;
 pub mod quota;
 pub mod rewrite;
 pub mod routing;
+pub mod runtime;
 pub mod secret;
 pub mod stats;
 pub mod store;
@@ -31,10 +34,12 @@ use crate::accounts::AccountStore;
 use crate::auth::{Admin, Invites, Keys};
 use crate::config::Config;
 use crate::login::LoginManager;
+use crate::monitor::Monitor;
 use crate::oauth::OAuthClient;
 use crate::policy::Engine;
 use crate::pool::AccountPool;
 use crate::routing::ModelRouter;
+use crate::runtime::{Runtime, RuntimeConfig};
 use crate::secret::SecretBox;
 use crate::stats::Recorder;
 use crate::store::Store;
@@ -58,8 +63,23 @@ pub struct Core {
     pub catalog: Catalog,
     pub login: LoginManager,
     pub routing: ModelRouter,
+    pub runtime: Runtime,
+    pub monitor: Monitor,
+    /// The address the proxy listener is bound to, while it runs.
+    listening: Arc<std::sync::RwLock<Option<String>>>,
+    /// Start / stop hooks for the listener, when the host can provide them
+    /// (the desktop app); `ccm-server` runs exactly one listener.
+    service: Arc<std::sync::OnceLock<Arc<dyn ServiceControl>>>,
     /// Guards [`Core::start_background`].
     background: Arc<std::sync::Once>,
+}
+
+/// Lets the admin API start and stop the proxy listener.
+pub trait ServiceControl: Send + Sync {
+    fn start(&self) -> Result<()>;
+    fn stop(&self) -> Result<()>;
+    /// Stop, then start on the current `runtime.listen`.
+    fn restart(&self) -> Result<()>;
 }
 
 /// What [`Core::open`] did on the way up, for the caller to report.
@@ -92,7 +112,9 @@ impl Core {
             &config.upstream.oauth_token_url,
             &config.upstream.oauth_client_id,
         );
-        let pool = AccountPool::new(accounts.clone(), oauth, config.pool.clone());
+        let runtime = Runtime::load(store.clone(), &config)?;
+        let rt = runtime.get();
+        let pool = AccountPool::new(accounts.clone(), oauth, rt.pool.clone());
         let upstream = Upstream::new(&config.upstream, pool.clone());
         Ok((
             Core {
@@ -103,7 +125,11 @@ impl Core {
                 recorder: Recorder::new(store.clone()),
                 catalog: Catalog::new(upstream.clone()),
                 login: LoginManager::new(&config.upstream),
-                routing: ModelRouter::new(store.clone(), config.routing.clone()),
+                routing: ModelRouter::new(store.clone(), rt.routing.clone()),
+                monitor: Monitor::new(rt.monitor.clone()),
+                runtime,
+                listening: Default::default(),
+                service: Default::default(),
                 background: Arc::new(std::sync::Once::new()),
                 upstream,
                 config: Arc::new(config),
@@ -113,6 +139,39 @@ impl Core {
             },
             startup,
         ))
+    }
+}
+
+impl Core {
+    /// Saves a settings patch (see [`Runtime::update`]) and applies it to
+    /// the components that read it.
+    pub fn update_runtime(&self, patch: &serde_json::Value) -> Result<RuntimeConfig> {
+        let c = self.runtime.update(patch)?;
+        self.pool.set_config(c.pool.clone());
+        self.routing.set_config(c.routing.clone());
+        self.monitor.set_config(c.monitor.clone());
+        Ok(c)
+    }
+
+    /// Installs the listener controls; only the first call takes effect.
+    pub fn set_service_control(&self, control: Arc<dyn ServiceControl>) {
+        let _ = self.service.set(control);
+    }
+
+    pub fn service_control(&self) -> Option<Arc<dyn ServiceControl>> {
+        self.service.get().cloned()
+    }
+
+    /// Where the listener is bound, or `None` when it isn't running.
+    pub fn listening(&self) -> Option<String> {
+        self.listening
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_listening(&self, addr: Option<String>) {
+        *self.listening.write().unwrap_or_else(|e| e.into_inner()) = addr;
     }
 }
 

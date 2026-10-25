@@ -22,6 +22,7 @@ use crate::Core;
 
 pub(super) fn routes() -> Router<Core> {
     Router::new()
+        .merge(super::ops::routes())
         .route("/status", get(status))
         .route("/users", get(list_users).post(create_user))
         .route("/users/:id/enable", post(enable_user))
@@ -48,9 +49,9 @@ pub(super) fn routes() -> Router<Core> {
         .route("/usage", get(usage))
 }
 
-type ApiResult = Result<Response, Response>;
+pub(super) type ApiResult = Result<Response, Response>;
 
-fn internal(e: anyhow::Error) -> Response {
+pub(super) fn internal(e: anyhow::Error) -> Response {
     json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
@@ -59,7 +60,7 @@ fn no_content() -> Response {
 }
 
 /// Runs CPU-heavy (bcrypt) work off the async workers.
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
     tokio::task::spawn_blocking(f).await?
