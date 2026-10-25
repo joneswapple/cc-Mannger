@@ -6,6 +6,7 @@ mod insights;
 mod ops;
 mod proxy;
 mod system;
+mod tunnel_api;
 
 pub use ops::LOCAL_CLAUDE_CODE_USER;
 
@@ -53,18 +54,51 @@ impl Core {
     }
 }
 
-pub fn router(core: Core) -> Router {
-    // The terminal-facing surface goes through the IP rules and access log;
-    // the admin API never does, so a bad rule can't lock the admin out.
-    let guarded = Router::new()
+/// The terminal-facing surface. It goes through the IP rules and access
+/// log; the admin API never does, so a bad rule can't lock the admin out.
+fn terminal_routes(core: &Core) -> Router<Core> {
+    Router::new()
         .route("/v1/messages", post(proxy::messages))
         .route("/v1/messages/count_tokens", post(proxy::count_tokens))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::models))
         .route("/register", post(admin::register))
-        .route_layer(middleware::from_fn_with_state(core.clone(), guard_ip));
+        .route_layer(middleware::from_fn_with_state(core.clone(), guard_ip))
+}
+
+/// What the Cloudflare tunnel serves: the terminal routes and `/healthz`,
+/// plus the admin API and web UI only when `expose_admin`. Requests are
+/// marked so the client IP comes from `CF-Connecting-IP`.
+pub fn public_router(core: Core, expose_admin: bool) -> Router {
+    let app = if expose_admin {
+        let full = router(core.clone());
+        match core.extra_routes() {
+            Some(extra) => full.merge(extra),
+            None => full,
+        }
+    } else {
+        Router::new()
+            .merge(terminal_routes(&core))
+            .route("/healthz", get(healthz))
+            .layer(DefaultBodyLimit::max(MAX_BODY))
+            .layer(middleware::from_fn(log_requests))
+            .with_state(core)
+    };
+    app.layer(middleware::from_fn(mark_tunnel))
+}
+
+/// Request extension: arrived through the Cloudflare tunnel listener.
+#[derive(Clone, Copy)]
+pub(crate) struct ViaTunnel;
+
+async fn mark_tunnel(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(ViaTunnel);
+    next.run(req).await
+}
+
+pub fn router(core: Core) -> Router {
     Router::new()
-        .merge(guarded)
+        .merge(terminal_routes(&core))
         .route("/oauth/callback", get(admin::oauth_callback))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
@@ -93,6 +127,7 @@ pub async fn serve_with(
     let bound = listener
         .local_addr()
         .map_or(listen.clone(), |a| a.to_string());
+    core.set_extra_routes(extra.clone());
     core.start_background();
     core.set_listening(Some(bound.clone()));
     tracing::info!("cc-manager listening on {bound}");
@@ -113,6 +148,16 @@ impl Core {
     pub fn start_background(&self) {
         self.background.call_once(|| {
             self.catalog.start(CATALOG_REFRESH);
+            if self.runtime.get().tunnel.auto_start {
+                let core = self.clone();
+                tokio::spawn(async move {
+                    // Let the host install its extra routes first.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if let Err(e) = core.start_tunnel().await {
+                        tracing::warn!("tunnel auto-start: {e:#}");
+                    }
+                });
+            }
             let (security, runtime) = (self.security.clone(), self.runtime.clone());
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(3600));
@@ -141,6 +186,15 @@ impl Core {
                 });
             }
         });
+    }
+}
+
+impl Core {
+    /// Starts the Cloudflare tunnel with the current runtime settings.
+    pub async fn start_tunnel(&self) -> Result<crate::tunnel::TunnelStatus> {
+        let cfg = self.runtime.get().tunnel;
+        let app = public_router(self.clone(), cfg.expose_admin);
+        self.tunnel.start(&cfg, app).await
     }
 }
 
@@ -309,6 +363,15 @@ impl FromRequestParts<Core> for ClientIp {
 }
 
 pub(crate) fn client_ip(parts: &Parts, core: &Core) -> String {
+    // The tunnel listener is loopback-only and fed by cloudflared, which
+    // sets CF-Connecting-IP to the real client.
+    if parts.extensions.get::<ViaTunnel>().is_some() {
+        if let Some(ip) = header(&parts.headers, "cf-connecting-ip")
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+        {
+            return ip.to_canonical().to_string();
+        }
+    }
     if core.runtime.get().security.trust_forwarded_for {
         let forwarded = header(&parts.headers, "x-forwarded-for")
             .and_then(|v| v.split(',').next())

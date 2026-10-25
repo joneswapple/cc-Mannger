@@ -28,6 +28,7 @@ pub mod secret;
 pub mod security;
 pub mod stats;
 pub mod store;
+pub mod tunnel;
 pub mod update;
 pub mod upstream;
 
@@ -51,6 +52,7 @@ use crate::secret::SecretBox;
 use crate::security::Security;
 use crate::stats::Recorder;
 use crate::store::Store;
+use crate::tunnel::Tunnel;
 use crate::upstream::{Catalog, Upstream};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -75,7 +77,11 @@ pub struct Core {
     pub runtime: Runtime,
     pub monitor: Monitor,
     pub security: Security,
+    pub tunnel: Tunnel,
     pub proxies: ProxyList,
+    /// Routes the host serves next to the API (the embedded web UI), so the
+    /// tunnel can serve them too when it exposes the admin side.
+    extra_routes: Arc<std::sync::OnceLock<axum::Router>>,
     /// The address the proxy listener is bound to, while it runs.
     listening: Arc<std::sync::RwLock<Option<String>>>,
     /// Start / stop hooks for the listener, when the host can provide them
@@ -109,7 +115,8 @@ impl Core {
         let store = Store::open(&config.data_dir)?;
         let secrets =
             SecretBox::load(&config.secret_key, &config.data_dir).context("load secret key")?;
-        let accounts = AccountStore::new(store.clone(), Arc::new(secrets));
+        let secrets = Arc::new(secrets);
+        let accounts = AccountStore::new(store.clone(), secrets.clone());
         let mut startup = Startup::default();
         match provider::import_cli_credentials(
             &accounts,
@@ -140,6 +147,13 @@ impl Core {
                 routing: ModelRouter::new(store.clone(), rt.routing.clone()),
                 monitor: Monitor::new(rt.monitor.clone()),
                 security: Security::new(store.clone())?,
+                tunnel: Tunnel::new(
+                    store.clone(),
+                    secrets,
+                    &config.data_dir,
+                    &config.cloudflared_download_url,
+                ),
+                extra_routes: Default::default(),
                 proxies: ProxyList::new(store.clone()),
                 runtime,
                 listening: Default::default(),
@@ -182,6 +196,14 @@ impl Core {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub(crate) fn set_extra_routes(&self, extra: axum::Router) {
+        let _ = self.extra_routes.set(extra);
+    }
+
+    pub(crate) fn extra_routes(&self) -> Option<axum::Router> {
+        self.extra_routes.get().cloned()
     }
 
     pub(crate) fn set_listening(&self, addr: Option<String>) {

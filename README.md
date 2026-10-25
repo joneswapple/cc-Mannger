@@ -43,6 +43,9 @@ for Claude only.
   estimated cost from an editable price table, activity heatmap.
 - **Terminals**: key expiry and renewal, a distinct-IP limit per 24 h,
   per-terminal usage and IP history.
+- **Public access**: one-click Cloudflare Tunnel (quick `*.trycloudflare.com`
+  URL or a named tunnel by token) on its own listener that serves only the
+  terminal routes by default; `cloudflared` is downloaded for you.
 - **Security**: CIDR deny / allow lists with expiry, IP access log and
   per-IP stats (the admin API is never filtered).
 - **Settings center**: scheduling, proxy pool, usage polling and more
@@ -245,6 +248,8 @@ Admin endpoints need `Authorization: Bearer <admin token>` (or
 | `GET`  | `/admin/api/security/log`, `/security/ips`   | admin         | Access log (`ip`, `filter`, `page`) / per-IP stats.     |
 | `GET` `POST` | `/admin/api/proxies`, `POST /proxies/test`, `/proxies/{id}/{delete,test,assign}` | admin | Shared proxy list. |
 | `GET`  | `/admin/api/logs`, `POST /logs/clear`        | admin         | Recent log lines (`after`, `level`, `limit`).           |
+| `GET`  | `/admin/api/tunnel`, `/tunnel/logs`          | admin         | Tunnel status + settings / cloudflared output.          |
+| `POST` | `/admin/api/tunnel/{install,start,stop}`, `/tunnel/token` | admin | Install cloudflared, start/stop, `{token}` (null clears; never returned). Settings via `runtime.tunnel`. |
 | `GET`  | `/admin/api/update/check`, `/admin/api/system` | admin       | Latest release vs this build / version and paths.       |
 
 Errors under `/v1/*` use Anthropic's `{"type":"error","error":{"type","message"}}`
@@ -280,6 +285,9 @@ ccm-server admin claude-code status | sync --base-url http://127.0.0.1:8787 | re
 ccm-server admin security rules | deny 203.0.113.0/24 --hours 24 | allow 10.0.0.0/8 | delete-rule 3 | log --blocked | ips
 ccm-server admin proxy list | add socks5h://127.0.0.1:1080 --name hk | test 1 | assign 1 2,3
 ccm-server admin logs --level WARN | update-check | system
+ccm-server admin tunnel install | start | status | stop | logs
+ccm-server admin tunnel set --mode token --protocol http2 --port 8788 --expose-admin false
+echo "$TUNNEL_TOKEN" | ccm-server admin tunnel token -
 ccm-server admin usage --status error --page-size 20
 ccm-server admin reset-token [--token my-secret]      # local DB, no server needed
 ccm-server effort list | expand --tier high

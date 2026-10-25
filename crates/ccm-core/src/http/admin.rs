@@ -25,6 +25,7 @@ pub(super) fn routes() -> Router<Core> {
         .merge(super::ops::routes())
         .merge(super::insights::routes())
         .merge(super::system::routes())
+        .merge(super::tunnel_api::routes())
         .route("/status", get(status))
         .route("/users", get(list_users).post(create_user))
         .route("/users/:id/enable", post(enable_user))

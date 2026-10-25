@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    Config, DesktopConfig, MonitorConfig, PoolConfig, RoutingConfig, SecurityConfig,
+    Config, DesktopConfig, MonitorConfig, PoolConfig, RoutingConfig, SecurityConfig, TunnelConfig,
 };
 use crate::store::Store;
 
@@ -29,6 +29,7 @@ pub struct RuntimeConfig {
     pub monitor: MonitorConfig,
     pub security: SecurityConfig,
     pub desktop: DesktopConfig,
+    pub tunnel: TunnelConfig,
     /// Seconds between polls of the optional usage endpoint.
     pub usage_poll_secs: u64,
 }
@@ -48,6 +49,7 @@ impl RuntimeConfig {
             monitor: c.monitor.clone(),
             security: c.security.clone(),
             desktop: c.desktop.clone(),
+            tunnel: c.tunnel.clone(),
             usage_poll_secs: c.upstream.usage_poll_secs,
         }
     }
@@ -72,7 +74,8 @@ impl RuntimeConfig {
         if self.usage_poll_secs < 60 {
             bail!("usage_poll_secs must be at least 60");
         }
-        self.security.validate()
+        self.security.validate()?;
+        self.tunnel.validate()
     }
 }
 

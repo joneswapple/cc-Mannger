@@ -93,6 +93,8 @@ pub enum AdminCommand {
     Security(SecurityCommand),
     #[command(subcommand)]
     Proxy(ProxyCommand),
+    #[command(subcommand)]
+    Tunnel(TunnelCommand),
     /// Recent server log lines.
     Logs {
         /// ERROR | WARN | INFO | DEBUG
@@ -174,6 +176,40 @@ pub enum SecurityCommand {
     Ips {
         #[arg(long, default_value_t = 7)]
         days: i64,
+    },
+}
+
+/// Public access through a Cloudflare tunnel.
+#[derive(Subcommand)]
+pub enum TunnelCommand {
+    Status,
+    /// Download cloudflared into the data directory.
+    Install,
+    Start,
+    Stop,
+    /// Save the tunnel token for token mode (`-` reads it from stdin).
+    Token {
+        token: String,
+    },
+    ClearToken,
+    /// Recent cloudflared output.
+    Logs,
+    /// Change tunnel settings (applied on the next start).
+    Set {
+        /// quick | token
+        #[arg(long)]
+        mode: Option<String>,
+        /// auto | http2 | quic
+        #[arg(long)]
+        protocol: Option<String>,
+        /// Loopback port the tunnel forwards to.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Also serve the admin API and web UI through the tunnel.
+        #[arg(long)]
+        expose_admin: Option<bool>,
+        #[arg(long)]
+        auto_start: Option<bool>,
     },
 }
 
@@ -718,6 +754,53 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 json!({ "account_ids": accounts }),
             )
             .await?
+        }
+        AdminCommand::Tunnel(TunnelCommand::Status) => c.get("/admin/api/tunnel").await?,
+        AdminCommand::Tunnel(TunnelCommand::Install) => {
+            c.post("/admin/api/tunnel/install", Value::Null).await?
+        }
+        AdminCommand::Tunnel(TunnelCommand::Start) => {
+            c.post("/admin/api/tunnel/start", Value::Null).await?
+        }
+        AdminCommand::Tunnel(TunnelCommand::Stop) => {
+            c.post("/admin/api/tunnel/stop", Value::Null).await?
+        }
+        AdminCommand::Tunnel(TunnelCommand::Token { token }) => {
+            let token = if token == "-" {
+                let mut s = String::new();
+                std::io::stdin().read_line(&mut s)?;
+                s.trim().to_string()
+            } else {
+                token
+            };
+            c.post("/admin/api/tunnel/token", json!({ "token": token }))
+                .await?
+        }
+        AdminCommand::Tunnel(TunnelCommand::ClearToken) => {
+            c.post("/admin/api/tunnel/token", json!({ "token": null }))
+                .await?
+        }
+        AdminCommand::Tunnel(TunnelCommand::Logs) => c.get("/admin/api/tunnel/logs").await?,
+        AdminCommand::Tunnel(TunnelCommand::Set {
+            mode,
+            protocol,
+            port,
+            expose_admin,
+            auto_start,
+        }) => {
+            let mut t = serde_json::Map::new();
+            for (k, v) in [
+                ("mode", mode.map(Value::from)),
+                ("protocol", protocol.map(Value::from)),
+                ("local_port", port.map(Value::from)),
+                ("expose_admin", expose_admin.map(Value::from)),
+                ("auto_start", auto_start.map(Value::from)),
+            ] {
+                if let Some(v) = v {
+                    t.insert(k.into(), v);
+                }
+            }
+            c.post("/admin/api/runtime", json!({ "tunnel": t })).await?
         }
         AdminCommand::Logs { level, limit } => {
             c.get_query(

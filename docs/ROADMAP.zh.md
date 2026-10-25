@@ -177,6 +177,15 @@ Gemini 专属功能（生图、ls_core、设备指纹等）不做。参考项目
   关于（检查更新）。桌面端新增迷你悬浮窗（托盘或设置中打开）和开机自启（tauri-plugin-autostart）。
   自动更新没有接 tauri-plugin-updater（需要发布签名密钥和更新源）；"检查更新"通过 GitHub Releases API 比较版本并打开发布页。
 
+### R11：公网访问（Cloudflare Tunnel）✅ 已完成
+
+- 一键下载 `cloudflared` 到数据目录（也可用 PATH 中的或指定路径），两种模式：快速隧道（临时 *.trycloudflare.com 地址）
+  和 Token 模式（Cloudflare 后台创建的固定域名；Token 加密保存，经环境变量传给 cloudflared，不出现在命令行）。
+- 隧道指向专用的本机监听端口（默认 127.0.0.1:8788），默认只公开 /v1/*、/register、/healthz，可选同时暴露管理后台；
+  经隧道的请求按 `CF-Connecting-IP` 识别真实 IP，黑白名单与终端 IP 上限照常生效。
+- 协议可选自动 / HTTP2 / QUIC，可随服务自动开启；"API 反代"页的公网访问卡片可安装、启停、复制公网地址、查看 cloudflared 输出，
+  接入示例可一键切换为公网地址；命令行 `ccm-server admin tunnel …`。退出 ccm-server / 桌面应用时会结束 cloudflared。
+
 ## 4. 风险与说明
 
 1. **服务条款**：Anthropic 消费者条款不允许共享 / 转售 Pro/Max 订阅，多账号轮换可能导致封号。

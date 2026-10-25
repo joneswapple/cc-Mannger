@@ -79,6 +79,9 @@ async fn fake_handler(
         }))
         .into_response();
     }
+    if uri.path() == "/cloudflared-bin" {
+        return FAKE_CLOUDFLARED.into_response();
+    }
     if uri.path() == "/releases/latest" {
         return axum::Json(json!({
             "tag_name": "v99.1.0", "html_url": "https://example.invalid/r", "body": "notes",
@@ -122,6 +125,19 @@ async fn fake_handler(
             .unwrap(),
     }
 }
+
+/// Stands in for cloudflared: prints a version, its arguments, and the URL
+/// line the real one would, then idles until killed.
+const FAKE_CLOUDFLARED: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "cloudflared version 2026.1.0 (fake)"; exit 0; fi
+echo "args: $*" >&2
+if [ -n "$TUNNEL_TOKEN" ]; then
+  echo 'INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"cc.example.com\"}]}"' >&2
+else
+  echo "INF |  https://fake-tunnel.trycloudflare.com  |" >&2
+fi
+exec sleep 60
+"#;
 
 struct Harness {
     core: Core,
@@ -174,6 +190,7 @@ async fn harness() -> Harness {
     cfg.upstream.user_agent = "test-ua".into();
     cfg.upstream.anthropic_beta = "test-beta".into();
     cfg.update_url = format!("http://{addr}/releases/latest");
+    cfg.cloudflared_download_url = format!("http://{addr}/cloudflared-bin");
     cfg.claude_settings_path = dir
         .path()
         .join("home/.claude/settings.json")
@@ -2109,4 +2126,142 @@ async fn logs_update_check_and_system() {
     let (_, sys) = h.admin("GET", "/admin/api/system", None).await;
     assert_eq!(sys["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(sys["desktop"], false);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cloudflare_tunnel_install_start_routes_and_stop() {
+    let h = harness().await;
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (s, _) = h
+        .admin(
+            "POST",
+            "/admin/api/runtime",
+            Some(json!({"tunnel": {"local_port": port}})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (s, v) = h.admin("POST", "/admin/api/tunnel/install", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (
+            v["status"]["installed"].clone(),
+            v["status"]["managed"].clone()
+        ),
+        (json!(true), json!(true))
+    );
+    assert!(v["status"]["version"].as_str().unwrap().contains("fake"));
+
+    let wait_url = || async {
+        for _ in 0..50 {
+            let (_, v) = h.admin("GET", "/admin/api/tunnel", None).await;
+            if let Some(u) = v["status"]["url"].as_str() {
+                return u.to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("no tunnel URL");
+    };
+    let (s, v) = h.admin("POST", "/admin/api/tunnel/start", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"]["running"], true);
+    assert_eq!(wait_url().await, "https://fake-tunnel.trycloudflare.com");
+    let (_, logs) = h.admin("GET", "/admin/api/tunnel/logs", None).await;
+    assert!(logs["lines"][0]
+        .as_str()
+        .unwrap()
+        .contains(&format!("tunnel --url http://127.0.0.1:{port}")));
+
+    // The tunnel listener serves the terminal routes, not the admin API.
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let msg = |ip: Option<&'static str>| {
+        let mut r = http
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", &h.api_key)
+            .body(r#"{"model":"claude-test"}"#);
+        if let Some(ip) = ip {
+            r = r.header("cf-connecting-ip", ip);
+        }
+        r.send()
+    };
+    assert_eq!(msg(Some("203.0.113.5")).await.unwrap().status(), 200);
+    assert_eq!(
+        http.get(format!("{base}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let admin_via_tunnel = || {
+        http.get(format!("{base}/admin/api/status"))
+            .bearer_auth(ADMIN)
+            .send()
+    };
+    assert_eq!(admin_via_tunnel().await.unwrap().status(), 404);
+
+    // IP rules see the real client from CF-Connecting-IP.
+    h.admin(
+        "POST",
+        "/admin/api/security/rules",
+        Some(json!({"kind": "deny", "cidr": "203.0.113.5"})),
+    )
+    .await;
+    assert_eq!(msg(Some("203.0.113.5")).await.unwrap().status(), 403);
+    assert_eq!(
+        msg(None).await.unwrap().status(),
+        200,
+        "no header: the loopback peer"
+    );
+    let (_, log) = h
+        .admin("GET", "/admin/api/security/log?filter=blocked", None)
+        .await;
+    assert_eq!(log["entries"][0]["ip"], "203.0.113.5");
+
+    let (_, v) = h.admin("POST", "/admin/api/tunnel/stop", None).await;
+    assert_eq!(v["status"]["running"], false);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        http.get(format!("{base}/healthz")).send().await.is_err(),
+        "listener closed"
+    );
+
+    // Token mode: needs a token, passes it by environment only.
+    h.admin(
+        "POST",
+        "/admin/api/runtime",
+        Some(json!({"tunnel": {"mode": "token", "expose_admin": true}})),
+    )
+    .await;
+    let (s, e) = h.admin("POST", "/admin/api/tunnel/start", None).await;
+    assert_eq!(s, 400);
+    assert!(e["error"].as_str().unwrap().contains("token"));
+    let (_, v) = h
+        .admin(
+            "POST",
+            "/admin/api/tunnel/token",
+            Some(json!({"token": "eyJ0b2tlbiI6InNlY3JldCJ9"})),
+        )
+        .await;
+    assert_eq!(v["status"]["has_token"], true);
+    assert!(
+        !v.to_string().contains("eyJ0b2tlbiI6InNlY3JldCJ9"),
+        "token never returned"
+    );
+    let (s, _) = h.admin("POST", "/admin/api/tunnel/start", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(wait_url().await, "https://cc.example.com");
+    let (_, logs) = h.admin("GET", "/admin/api/tunnel/logs", None).await;
+    let first = logs["lines"][0].as_str().unwrap().to_string();
+    assert!(
+        first.contains("tunnel run") && !first.contains("eyJ0b2tl"),
+        "{first}"
+    );
+    // expose_admin serves the admin API too (still behind the admin token).
+    assert_eq!(admin_via_tunnel().await.unwrap().status(), 200);
+    h.core.tunnel.stop();
 }

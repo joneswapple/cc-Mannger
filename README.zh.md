@@ -28,6 +28,8 @@ English: [README.md](./README.md) · 阶段计划：[docs/ROADMAP.zh.md](./docs/
 - **请求监控**：可开关的内存录制，查看客户端请求 / 上游请求 / 响应体、首字耗时、映射后模型、账号与失败切换记录。
 - **统计**：按小时 / 天 / 周的趋势（可按模型、账号、终端拆分）、按可编辑价格表估算费用、活跃时段热力图。
 - **终端**：Key 有效期与续期、24 小时 IP 数上限、每个终端的用量与来源 IP。
+- **公网访问**：一键开启 Cloudflare Tunnel（快速隧道 `*.trycloudflare.com` 或 Token 固定域名），自动下载 cloudflared；
+  隧道走独立监听端口，默认只公开代理入口，不暴露管理后台。
 - **安全**：CIDR 黑 / 白名单（可设有效期）、IP 访问日志与统计（管理后台不受规则影响）。
 - **设置中心**：调度、代理池、额度刷新等运行时可改（存数据库、即时生效），实时运行日志，检查更新。
 - **桌面端**：托盘显示当前账号和额度、快速切换账号、启停代理；账号失效或全部限流时发系统通知；
@@ -163,6 +165,7 @@ ccm-server admin settings '{"pool":{"strategy":"least_used"}}'   # 运行时修�
 ccm-server admin monitor on                       # 开启请求录制
 ccm-server admin claude-code sync --base-url http://127.0.0.1:8787
 ccm-server admin security deny 203.0.113.0/24 --hours 24
+ccm-server admin tunnel install && ccm-server admin tunnel start   # 公网访问（快速隧道）
 ccm-server admin reset-token                      # 忘了管理员令牌时，直接写本地数据库
 ccm-server migrate-from-go --go-data-dir ~/.local/share/cliproxy
 ```

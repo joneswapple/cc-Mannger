@@ -1,6 +1,7 @@
 // Chinese / English UI strings. `t("a.b", {n: 1})` looks up a dotted key and
 // fills `{n}` placeholders; missing English keys fall back to Chinese.
-import { createContext, useContext, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { setFormatLang } from "./format";
 
 const zh = {
   common: {
@@ -543,6 +544,44 @@ const zh = {
     block_confirm: "把 {ip} 加入黑名单？",
     blocked_from_stats: "从 IP 统计拉黑",
   },
+  tunnel: {
+    title: "公网访问（Cloudflare Tunnel）",
+    online: "已连通",
+    connecting: "连接中…",
+    off: "未开启",
+    install: "安装 cloudflared",
+    installing: "下载中…",
+    installed_ok: "cloudflared 已安装",
+    reinstall: "重新下载",
+    warning: "开启后代理入口会暴露到公网。把 Pro/Max 账号开放到公网给他人使用明显违反 Anthropic 条款，封号风险更高；建议只用于自己跨网络访问，并配合 Key 有效期、IP 数上限和黑白名单。",
+    public_url: "公网地址",
+    open: "打开",
+    binary: "cloudflared",
+    managed: "由 CC Manager 下载",
+    not_installed: "未安装：可一键下载到数据目录，或放到 PATH / 在 tunnel.binary_path 指定",
+    mode: "隧道模式",
+    quick: "快速隧道",
+    token_mode: "Token（固定域名）",
+    mode_quick_hint: "无需 Cloudflare 账号，自动分配临时的 *.trycloudflare.com 地址，每次启动都会变化",
+    mode_token_hint: "在 Cloudflare 后台创建隧道，Public Hostname 的 Service 填 http://localhost:{port}",
+    token: "隧道 Token",
+    token_hint: "Cloudflare 后台 Zero Trust → Networks → Tunnels 中复制；加密保存，不会再显示",
+    token_saved: "已保存（加密），重新输入可替换",
+    clear: "清除",
+    protocol: "连接协议",
+    protocol_hint: "UDP 被拦截时改用 HTTP2",
+    auto: "自动",
+    local_port: "本地转发端口",
+    local_port_hint: "隧道专用的本机监听端口（只监听 127.0.0.1）",
+    expose_admin: "同时暴露管理后台",
+    expose_admin_hint: "默认只公开 /v1/*、/register 和 /healthz；开启后管理接口与网页界面也可经公网访问（仍需管理员令牌）",
+    auto_start: "随服务自动开启",
+    auto_start_hint: "启动 ccm-server / 桌面应用时自动连接隧道",
+    locked_hint: "隧道运行中（{since}启动），修改模式、协议、端口或后台暴露后需停止再启动才生效。",
+    show_logs: "查看 cloudflared 日志",
+    hide_logs: "收起日志",
+    use_public: "使用公网地址",
+  },
 };
 
 type Dict = typeof zh;
@@ -1083,6 +1122,44 @@ const en: DeepPartial<Dict> = {
     block_confirm: "Add {ip} to the deny list?",
     blocked_from_stats: "Blocked from IP stats",
   },
+  tunnel: {
+    title: "Public access (Cloudflare Tunnel)",
+    online: "Online",
+    connecting: "Connecting…",
+    off: "Off",
+    install: "Install cloudflared",
+    installing: "Downloading…",
+    installed_ok: "cloudflared installed",
+    reinstall: "Download again",
+    warning: "This puts the proxy on the public internet. Opening Pro/Max accounts to other people over the internet clearly breaks Anthropic's terms and raises the ban risk; use it only to reach your own setup from other networks, together with key expiry, IP limits and IP rules.",
+    public_url: "Public URL",
+    open: "Open",
+    binary: "cloudflared",
+    managed: "downloaded by CC Manager",
+    not_installed: "Not installed: download it into the data directory, or put it on PATH / set tunnel.binary_path",
+    mode: "Tunnel mode",
+    quick: "Quick tunnel",
+    token_mode: "Token (own domain)",
+    mode_quick_hint: "No Cloudflare account needed; a temporary *.trycloudflare.com URL that changes on every start",
+    mode_token_hint: "Create a tunnel in the Cloudflare dashboard and point its public hostname's service at http://localhost:{port}",
+    token: "Tunnel token",
+    token_hint: "From Zero Trust → Networks → Tunnels; stored encrypted and never shown again",
+    token_saved: "Saved (encrypted); enter a new one to replace it",
+    clear: "Clear",
+    protocol: "Protocol",
+    protocol_hint: "Use HTTP2 where UDP is blocked",
+    auto: "Auto",
+    local_port: "Local port",
+    local_port_hint: "The tunnel's own listener (127.0.0.1 only)",
+    expose_admin: "Also expose the admin side",
+    expose_admin_hint: "Off: only /v1/*, /register and /healthz are public. On: the admin API and web UI too (still behind the admin token)",
+    auto_start: "Start with the server",
+    auto_start_hint: "Connect the tunnel when ccm-server / the desktop app starts",
+    locked_hint: "Running (started {since}); stop and start again to apply mode, protocol, port or admin-exposure changes.",
+    show_logs: "Show cloudflared output",
+    hide_logs: "Hide output",
+    use_public: "Use the public URL",
+  },
 };
 
 export type Lang = "zh" | "en";
@@ -1124,6 +1201,11 @@ const Ctx = createContext<{ lang: Lang; t: T; toggle: () => void }>({
 
 export function LangProvider({ children }: { children: ReactNode }) {
   const [lang, setLang] = useState<Lang>(initialLang);
+  // Before children render, so date helpers speak the same language.
+  setFormatLang(lang);
+  useEffect(() => {
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  }, [lang]);
   const toggle = () => {
     const next = lang === "zh" ? "en" : "zh";
     setLang(next);
@@ -1132,7 +1214,6 @@ export function LangProvider({ children }: { children: ReactNode }) {
     } catch {
       // session only
     }
-    document.documentElement.lang = next === "zh" ? "zh-CN" : "en";
   };
   return <Ctx.Provider value={{ lang, t: makeT(lang), toggle }}>{children}</Ctx.Provider>;
 }

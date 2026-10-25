@@ -137,10 +137,13 @@ async fn serve(cfg: Config) -> Result<()> {
         }
     }
     println!("upstream credentials: {}", core.pool.source());
-    ccm_core::http::serve_with(core, ui::router(), async {
+    let tunnel = core.tunnel.clone();
+    let r = ccm_core::http::serve_with(core, ui::router(), async {
         let _ = tokio::signal::ctrl_c().await;
     })
-    .await
+    .await;
+    tunnel.stop();
+    r
 }
 
 /// Installs a new admin token directly in the local database (works without

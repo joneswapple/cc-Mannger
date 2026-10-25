@@ -232,17 +232,20 @@ export function Segmented<K extends string>({
   value,
   options,
   onChange,
+  disabled,
 }: {
   value: K;
   options: { key: K; label: ReactNode; title?: string }[];
   onChange: (k: K) => void;
+  disabled?: boolean;
 }) {
   return (
-    <div className="inline-flex shrink-0 rounded-xl bg-slate-100 p-1 dark:bg-slate-800">
+    <div className={`inline-flex shrink-0 rounded-xl bg-slate-100 p-1 dark:bg-slate-800 ${disabled ? "pointer-events-none opacity-50" : ""}`} aria-disabled={disabled}>
       {options.map((o) => (
         <button
           key={o.key}
           title={o.title}
+          disabled={disabled}
           onClick={() => onChange(o.key)}
           className={`inline-flex items-center gap-1 whitespace-nowrap rounded-lg px-3 py-1.5 text-sm transition-colors ${
             value === o.key

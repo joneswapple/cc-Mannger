@@ -513,6 +513,14 @@ pub fn run() {
             open_mini,
             show_main_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running CC Manager");
+        .build(tauri::generate_context!())
+        .expect("error while building CC Manager")
+        .run(|app, event| {
+            // Don't leave cloudflared running behind the app.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(core) = app.try_state::<Core>() {
+                    core.tunnel.stop();
+                }
+            }
+        });
 }

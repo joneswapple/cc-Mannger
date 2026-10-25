@@ -23,12 +23,72 @@ pub struct Config {
     pub monitor: MonitorConfig,
     pub security: SecurityConfig,
     pub desktop: DesktopConfig,
+    pub tunnel: TunnelConfig,
+    /// Where `cloudflared` is downloaded from; empty means the official
+    /// GitHub release for this platform.
+    pub cloudflared_download_url: String,
     /// Claude Code settings file written by "sync to this machine"; empty
     /// means `~/.claude/settings.json`.
     pub claude_settings_path: String,
     /// GitHub "latest release" API URL for the update check; empty
     /// disables it.
     pub update_url: String,
+}
+
+/// Public access through a Cloudflare Tunnel (`tunnel.rs`). The token for
+/// token mode is stored encrypted, not here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TunnelConfig {
+    /// `quick` (temporary *.trycloudflare.com URL, no account) or `token`
+    /// (a named tunnel created in the Cloudflare dashboard).
+    pub mode: TunnelMode,
+    /// Start the tunnel together with the server / app.
+    pub auto_start: bool,
+    /// Also serve the admin API (and web UI) through the tunnel. Off by
+    /// default: only `/v1/*`, `/register` and `/healthz` are public.
+    pub expose_admin: bool,
+    /// `auto`, `http2` or `quic` (`--protocol`); http2 helps where UDP is
+    /// blocked.
+    pub protocol: String,
+    /// Loopback port of the tunnel's own listener. In token mode, point the
+    /// tunnel's public hostname at `http://localhost:<port>`.
+    pub local_port: u16,
+    /// Use this `cloudflared` instead of the managed or PATH one.
+    pub binary_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelMode {
+    #[default]
+    Quick,
+    Token,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            mode: TunnelMode::Quick,
+            auto_start: false,
+            expose_admin: false,
+            protocol: "auto".into(),
+            local_port: 8788,
+            binary_path: String::new(),
+        }
+    }
+}
+
+impl TunnelConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.protocol.as_str(), "auto" | "http2" | "quic") {
+            anyhow::bail!("tunnel.protocol must be auto, http2 or quic");
+        }
+        if self.local_port == 0 {
+            anyhow::bail!("tunnel.local_port must be a fixed port");
+        }
+        Ok(())
+    }
 }
 
 /// Client-IP handling for `/v1/*` and `/register` (`security.rs`).
@@ -268,6 +328,8 @@ impl Default for Config {
             admin: AdminConfig::default(),
             monitor: MonitorConfig::default(),
             security: SecurityConfig::default(),
+            tunnel: TunnelConfig::default(),
+            cloudflared_download_url: String::new(),
             desktop: DesktopConfig::default(),
             claude_settings_path: String::new(),
             update_url: "https://api.github.com/repos/joneswapple/cc-Mannger/releases/latest"

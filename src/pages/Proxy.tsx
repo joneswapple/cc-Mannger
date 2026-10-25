@@ -1,7 +1,8 @@
-import { ArrowRight, Check, Copy, FlaskConical, Globe, KeyRound, Link2, Play, Plus, Radio, RefreshCw, RotateCcw, Route, Save, Square, Terminal, Trash2, Undo2, Wand2 } from "lucide-react";
+import { ArrowRight, Check, Cloud, Copy, FlaskConical, Globe, KeyRound, Link2, Play, Plus, Radio, RefreshCw, RotateCcw, Route, Save, Square, Terminal, Trash2, Undo2, Wand2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { get, isTauri, post } from "../api";
 import { useI18n } from "../i18n";
+import TunnelCard from "./TunnelCard";
 import { useToast } from "../toast";
 import type { ClaudeCodeStatus, ModelRoute, ModelTest, RuntimeView, ServiceStatus, Settings } from "../types";
 import { Badge, Button, Card, ErrorBox, Field, IconButton, Segmented, SettingRow, Switch, inputBase, inputClass, useAction, useLoad } from "../ui";
@@ -32,6 +33,7 @@ export default function Proxy() {
   const service = useLoad(() => get<ServiceStatus>("/service"));
   const runtime = useLoad(() => get<RuntimeView>("/runtime"));
   const settings = useLoad(() => get<Settings>("/settings"));
+  const [publicUrl, setPublicUrl] = useState<string | null>(null);
   const port = splitListen(service.data?.bound ?? service.data?.listen ?? ":8787").port || "8787";
   const reloadAll = () => {
     void service.reload();
@@ -49,7 +51,8 @@ export default function Proxy() {
       </div>
       <ErrorBox error={service.error ?? runtime.error ?? settings.error} />
       {service.data && runtime.data && <ServiceCard svc={service.data} rt={runtime.data} reload={reloadAll} />}
-      <Connection port={port} settings={settings.data} />
+      <TunnelCard onUrl={setPublicUrl} />
+      <Connection port={port} settings={settings.data} publicUrl={publicUrl} />
       {settings.data && runtime.data && <Mapping settings={settings.data} rt={runtime.data} reload={reloadAll} />}
       {settings.data && <ModelTests settings={settings.data} />}
       <ClaudeCodeSync port={port} />
@@ -152,7 +155,7 @@ function ServiceCard({ svc, rt, reload }: { svc: ServiceStatus; rt: RuntimeView;
   );
 }
 
-function Connection({ port, settings }: { port: string; settings: Settings | null }) {
+function Connection({ port, settings, publicUrl }: { port: string; settings: Settings | null; publicUrl: string | null }) {
   const { t } = useI18n();
   const defaultUrl = isTauri ? `http://${t("connect.lan_ip")}:${port}` : location.origin;
   const [url, setUrl] = useState(defaultUrl);
@@ -199,6 +202,11 @@ function Connection({ port, settings }: { port: string; settings: Settings | nul
               <input className={`${inputClass} pl-9 font-mono`} value={url} onChange={(e) => setUrl(e.target.value)} />
             </div>
           </Field>
+          {publicUrl && url !== publicUrl && (
+            <Button small icon={<Cloud className="h-3.5 w-3.5" />} onClick={() => setUrl(publicUrl)}>
+              {t("tunnel.use_public")}
+            </Button>
+          )}
           <Field label={t("connect.key")} hint={t("connect.key_hint")}>
             <div className="relative">
               <KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />

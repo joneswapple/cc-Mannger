@@ -3,23 +3,34 @@ export function fmtTime(ts: number | null | undefined): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
+// The UI language for the helpers below; set by LangProvider on render.
+let zh = true;
+export function setFormatLang(lang: "zh" | "en") {
+  zh = lang === "zh";
+}
+
 export function fmtRelative(ts: number | null | undefined, now = Date.now() / 1000): string {
   if (!ts) return "—";
   const d = Math.round(ts - now);
   const abs = Math.abs(d);
-  const unit =
-    abs < 60 ? `${abs} 秒` : abs < 3600 ? `${Math.round(abs / 60)} 分钟` : abs < 86400 ? `${Math.round(abs / 3600)} 小时` : `${Math.round(abs / 86400)} 天`;
-  return d >= 0 ? `${unit}后` : `${unit}前`;
+  const [n, zhUnit, enUnit] =
+    abs < 60 ? [abs, "秒", "s"] : abs < 3600 ? [Math.round(abs / 60), "分钟", "min"] : abs < 86400 ? [Math.round(abs / 3600), "小时", "h"] : [Math.round(abs / 86400), "天", "d"];
+  if (zh) return d >= 0 ? `${n} ${zhUnit}后` : `${n} ${zhUnit}前`;
+  return d >= 0 ? `in ${n}${enUnit}` : `${n}${enUnit} ago`;
 }
 
 export function fmtDuration(secs: number): string {
-  if (secs <= 0) return "0 秒";
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  const s = Math.floor(secs % 60);
-  if (h) return `${h} 小时 ${m} 分`;
-  if (m) return `${m} 分 ${s} 秒`;
-  return `${s} 秒`;
+  const h = Math.floor(Math.max(0, secs) / 3600);
+  const m = Math.floor((Math.max(0, secs) % 3600) / 60);
+  const s = Math.floor(Math.max(0, secs) % 60);
+  if (zh) {
+    if (h) return `${h} 小时 ${m} 分`;
+    if (m) return `${m} 分 ${s} 秒`;
+    return `${s} 秒`;
+  }
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 export function fmtNum(n: number | null | undefined): string {

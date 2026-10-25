@@ -164,6 +164,7 @@ export interface RuntimeConfig {
   monitor: { enabled: boolean; capacity: number; max_body_bytes: number };
   security: { block_message: string; trust_forwarded_for: boolean; access_log_days: number };
   desktop: { auto_start_proxy: boolean };
+  tunnel: TunnelConfig;
   usage_poll_secs: number;
 }
 
@@ -354,4 +355,32 @@ export interface SystemInfo {
   log_level: string;
   update_check: boolean;
   desktop: boolean;
+}
+
+export interface TunnelConfig {
+  mode: "quick" | "token";
+  auto_start: boolean;
+  expose_admin: boolean;
+  protocol: "auto" | "http2" | "quic";
+  local_port: number;
+  binary_path: string;
+}
+
+export interface TunnelStatus {
+  installed: boolean;
+  binary: string | null;
+  version: string | null;
+  managed: boolean;
+  installing: boolean;
+  running: boolean;
+  url: string | null;
+  local: string | null;
+  started_at: number | null;
+  error: string | null;
+  has_token: boolean;
+}
+
+export interface TunnelView {
+  status: TunnelStatus;
+  config: TunnelConfig;
 }

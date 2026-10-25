@@ -68,6 +68,13 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
     pruned hourly); applied by `http::guard_ip` to `/v1/*` and `/register`
     only, never to the admin API.
   - `proxies.rs` — shared proxy list; assigning writes `accounts.proxy_url`.
+  - `tunnel.rs` — Cloudflare tunnel: downloads `cloudflared` into
+    `data_dir/bin` (or uses `tunnel.binary_path` / PATH), runs it (quick
+    mode, or token mode with the sealed token passed via `TUNNEL_TOKEN`)
+    against its own loopback listener (`http::public_router`: terminal
+    routes + `/healthz`, admin API / UI only with `expose_admin`), and
+    reads the public URL from its output. Tunnel requests take the client
+    IP from `CF-Connecting-IP`.
   - `logbuf.rs` — tracing layer keeping recent log lines for the UI log
     viewer (hosts install it next to the fmt layer). `update.rs` — GitHub
     latest-release check.
@@ -101,7 +108,8 @@ only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
     `ServiceControl`), monitor, model test, Claude Code sync. `ClientIp`
     extracts the peer (or forwarded) address; `insights.rs` stats
     overview, prices, key expiry, terminal IPs; `system.rs`
-    security rules / log / IP stats, proxies, logs, update check, system info.
+    security rules / log / IP stats, proxies, logs, update check, system info;
+    `tunnel_api.rs` tunnel status / install / start / stop / token / logs.
 - `crates/ccm-server` — headless binary: `serve`, `config`, `admin …`
   (HTTP client over `/admin/api/*`, except `reset-token`), `effort …`,
   `migrate-from-go`. `build.rs` + rust-embed embed `dist/` (placeholder page
