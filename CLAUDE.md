@@ -11,7 +11,7 @@ and OpenAI Chat Completions requests from per-terminal `sk-cp-…` keys it
 issues itself. It is a Tauri v2 desktop app plus a headless server over one
 Rust core, modelled on lbjlaq/Antigravity-Manager. Claude OAuth accounts
 only — no Anthropic API-key accounts. Phase plan: `docs/ROADMAP.zh.md`
-(R0–R10 are done; the Go cliproxy has been removed).
+(R0–R11 are done; the Go cliproxy has been removed).
 
 ## Build / run / test
 
